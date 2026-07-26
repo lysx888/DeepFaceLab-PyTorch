@@ -409,19 +409,21 @@ class TFMTrainer:
                 loss_dst = nn.functional.l1_loss(dst_recon, dst_img)
 
                 swap_recon = model(dst_img, src_id)
-                loss_swap = nn.functional.l1_loss(swap_recon, src_img)
+                loss_swap_src = nn.functional.l1_loss(swap_recon, src_img)
+                loss_swap_dst = nn.functional.l1_loss(swap_recon, dst_recon.detach())
 
-                loss = loss_src + loss_dst + loss_swap
+                loss = loss_src + loss_dst + 0.5 * loss_swap_src + 0.5 * loss_swap_dst
 
                 if perceptual_weight > 0 and perceptual_loss_fn is not None:
                     loss = loss + perceptual_weight * perceptual_loss_fn(src_recon, src_img)
                     loss = loss + perceptual_weight * perceptual_loss_fn(dst_recon, dst_img)
+                    loss = loss + perceptual_weight * perceptual_loss_fn(swap_recon, dst_img)
 
                 if identity_weight > 0 and identity_loss_adapter is not None:
-                    src_recon_rgb = ((src_recon + 1.0) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
+                    swap_recon_rgb = ((swap_recon + 1.0) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
                     src_img_rgb = ((src_img + 1.0) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
-                    for b in range(src_recon_rgb.shape[0]):
-                        recon_np = src_recon_rgb[b].permute(1, 2, 0).cpu().numpy()
+                    for b in range(swap_recon_rgb.shape[0]):
+                        recon_np = swap_recon_rgb[b].permute(1, 2, 0).cpu().numpy()
                         orig_np = src_img_rgb[b].permute(1, 2, 0).cpu().numpy()
                         recon_faces = identity_loss_adapter.detect_faces(recon_np, max_num=1)
                         orig_faces = identity_loss_adapter.detect_faces(orig_np, max_num=1)
