@@ -92,6 +92,7 @@ class TFMTrainer:
         self._preview_dst_paths: list[Path] = []
         self._preview_n = 3
         self._preview_resolution = 128
+        self._preview_cache: dict[str, tuple[np.ndarray, torch.Tensor, torch.Tensor]] = {}
 
     def _resolve_device(self) -> torch.device:
         if self._device is not None:
@@ -137,6 +138,7 @@ class TFMTrainer:
         window_size: int = 8,
         skip_strength: float = 0.5,
         gradient_checkpoint: bool = False,
+        use_compile: bool = False,
         eye_priority: float = 1.0,
         mouth_priority: float = 1.0,
         nose_priority: float = 1.0,
@@ -236,6 +238,8 @@ class TFMTrainer:
             pin_memory=dl_cfg["pin_memory"],
             drop_last=True,
             worker_init_fn=worker_init_fn if dl_cfg["num_workers"] > 0 else None,
+            persistent_workers=dl_cfg["num_workers"] > 0,
+            prefetch_factor=4 if dl_cfg["num_workers"] > 0 else None,
         )
         dst_loader = DataLoader(
             dst_ds,
@@ -245,6 +249,8 @@ class TFMTrainer:
             pin_memory=dl_cfg["pin_memory"],
             drop_last=True,
             worker_init_fn=worker_init_fn if dl_cfg["num_workers"] > 0 else None,
+            persistent_workers=dl_cfg["num_workers"] > 0,
+            prefetch_factor=4 if dl_cfg["num_workers"] > 0 else None,
         )
 
         model = TFMModel.from_preset(
@@ -252,7 +258,21 @@ class TFMTrainer:
             resolution=resolution,
             gan_power=gan_power,
             window_size=window_size,
+            gradient_checkpoint=gradient_checkpoint,
         ).to(device)
+
+        if use_compile and device.type == "cuda" and hasattr(torch, "compile"):
+            try:
+                model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
+                model.decoder = torch.compile(model.decoder, mode="reduce-overhead")
+                model.wplus_mapper = torch.compile(model.wplus_mapper, mode="reduce-overhead")
+                if on_log is not None:
+                    on_log("torch.compile() enabled (reduce-overhead)", False)
+            except Exception as e:
+                _logger.warning(f"torch.compile() failed: {e}, continuing without compilation")
+
+        if device.type == "cuda":
+            model = model.to(memory_format=torch.channels_last)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
         scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
@@ -337,6 +357,7 @@ class TFMTrainer:
                 "lr_schedule": lr_schedule,
                 "gradient_clip": gradient_clip,
                 "gradient_checkpoint": gradient_checkpoint,
+                "use_compile": use_compile,
                 "skip_strength": skip_strength,
                 "eye_priority": eye_priority,
                 "mouth_priority": mouth_priority,
@@ -396,9 +417,9 @@ class TFMTrainer:
 
             t0 = time.time()
 
-            src_img = src_batch["image"].to(device, non_blocking=get_non_blocking())
+            src_img = src_batch["image"].to(device, non_blocking=get_non_blocking()).to(memory_format=torch.channels_last)
             src_id = src_batch["identity"].to(device, non_blocking=get_non_blocking())
-            dst_img = dst_batch["image"].to(device, non_blocking=get_non_blocking())
+            dst_img = dst_batch["image"].to(device, non_blocking=get_non_blocking()).to(memory_format=torch.channels_last)
             dst_id = dst_batch["identity"].to(device, non_blocking=get_non_blocking())
 
             with torch.amp.autocast(device.type, enabled=(use_amp and device.type == "cuda")):
@@ -423,16 +444,12 @@ class TFMTrainer:
 
                 if identity_weight > 0 and identity_loss_adapter is not None:
                     swap_recon_rgb = ((swap_recon + 1.0) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
-                    src_img_rgb = ((src_img + 1.0) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
-                    for b in range(swap_recon_rgb.shape[0]):
-                        recon_np = swap_recon_rgb[b].permute(1, 2, 0).cpu().numpy()
-                        orig_np = src_img_rgb[b].permute(1, 2, 0).cpu().numpy()
-                        recon_faces = identity_loss_adapter.detect_faces(recon_np, max_num=1)
-                        orig_faces = identity_loss_adapter.detect_faces(orig_np, max_num=1)
-                        if recon_faces and orig_faces and recon_faces[0].embedding is not None and orig_faces[0].embedding is not None:
+                    batch_recon = swap_recon_rgb.permute(0, 2, 3, 1).cpu().numpy()
+                    for b in range(batch_recon.shape[0]):
+                        recon_faces = identity_loss_adapter.detect_faces(batch_recon[b], max_num=1)
+                        if recon_faces and recon_faces[0].embedding is not None:
                             r_emb = torch.from_numpy(recon_faces[0].embedding).to(device)
-                            o_emb = torch.from_numpy(orig_faces[0].embedding).to(device)
-                            cos_sim = nn.functional.cosine_similarity(r_emb.unsqueeze(0), o_emb.unsqueeze(0))
+                            cos_sim = nn.functional.cosine_similarity(r_emb.unsqueeze(0), src_id[b:b+1])
                             loss = loss + identity_weight * (1.0 - cos_sim)
 
                 if gan_power > 0 and model.discriminator is not None:
@@ -445,7 +462,6 @@ class TFMTrainer:
                         disc_optimizer.zero_grad()
                         scaler.scale(disc_loss).backward()
                         scaler.step(disc_optimizer)
-                        scaler.update()
 
                     gen_gan_loss = nn.functional.binary_cross_entropy_with_logits(
                         model.discriminate(src_recon), torch.ones_like(disc_real_src)
@@ -633,6 +649,11 @@ class TFMTrainer:
         sampled = random.sample(paths, min(n, len(paths)))
         result = []
         for p in sampled:
+            cache_key = f"{p.name}_{resolution}"
+            cached = self._preview_cache.get(cache_key)
+            if cached is not None:
+                result.append(cached)
+                continue
             img = cv2.imread(str(p))
             if img is None:
                 continue
@@ -646,7 +667,9 @@ class TFMTrainer:
             else:
                 identity = torch.zeros(1, 512, dtype=torch.float32)
 
-            result.append((resized, img_t, identity))
+            entry = (resized, img_t, identity)
+            self._preview_cache[cache_key] = entry
+            result.append(entry)
         return result
 
     def _draw_head(self, width: int, name: str, idx: int, total: int) -> np.ndarray:
