@@ -92,11 +92,16 @@ class TFMDataset(Dataset):
             lm[:, 1] *= scale_y
             landmarks_tensor = torch.from_numpy(lm)
 
+        yaw_val = 0.0
+        if meta is not None and meta.yaw is not None:
+            yaw_val = meta.yaw
+
         return {
             "image": img_tensor,
             "mask": mask_tensor,
             "identity": identity_tensor,
             "landmarks": landmarks_tensor,
+            "yaw": torch.tensor(yaw_val, dtype=torch.float32),
         }
 
     def _render_mask(self, shape: tuple, meta: Optional[FaceMetadata]) -> np.ndarray:
