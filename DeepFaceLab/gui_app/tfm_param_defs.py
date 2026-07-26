@@ -104,6 +104,7 @@ TFM_PARAM_DEFS: list[ParamDef] = [
     ParamDef(key="jaw_priority", label="下颌优先:", type=ParamType.FLOAT, default=1.0, min_val=0.5, max_val=3.0, step=0.1, decimals=2, group=ParamGroup.FACE_DETAIL),
     ParamDef(key="face_style_power", label="脸部风格:", type=ParamType.FLOAT, default=0.0, min_val=0.0, max_val=1.0, step=0.01, decimals=3, group=ParamGroup.FACE_DETAIL),
     ParamDef(key="bg_style_power", label="背景风格:", type=ParamType.FLOAT, default=0.0, min_val=0.0, max_val=1.0, step=0.01, decimals=3, group=ParamGroup.FACE_DETAIL),
+    ParamDef(key="enable_mask", label="启用遮罩", type=ParamType.BOOL, default=True, group=ParamGroup.FACE_DETAIL),
     ParamDef(key="perceptual_weight", label="感知损失:", type=ParamType.FLOAT, default=0.1, min_val=0.0, max_val=1.0, step=0.01, decimals=3, group=ParamGroup.LOSS_SAMPLING),
     ParamDef(key="identity_weight", label="身份保持:", type=ParamType.FLOAT, default=0.05, min_val=0.0, max_val=1.0, step=0.01, decimals=3, group=ParamGroup.LOSS_SAMPLING),
     ParamDef(key="uniform_yaw_sampling", label="均匀角度采样", type=ParamType.BOOL, default=False, group=ParamGroup.LOSS_SAMPLING),
