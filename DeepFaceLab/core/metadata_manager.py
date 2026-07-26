@@ -26,9 +26,9 @@ class FaceMetadata:
     source_face_rect: Optional[list[float]] = None
     landmarks_106_visibility: list[bool] = field(default_factory=lambda: [True] * LANDMARK_POINTS)
     kps_5_visibility: list[bool] = field(default_factory=lambda: [True] * KPS5_POINTS)
-    eyebrows_expand_mod: float = 1.0
     seg_ie_polys: Optional[list[dict]] = None
     arcface_embedding: Optional[npt.NDArray[np.float32]] = None
+    yaw: Optional[float] = None
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -49,12 +49,12 @@ class FaceMetadata:
             d["source_face_rect"] = self.source_face_rect
         d["landmarks_106_visibility"] = self.landmarks_106_visibility
         d["kps_5_visibility"] = self.kps_5_visibility
-        if self.eyebrows_expand_mod != 1.0:
-            d["eyebrows_expand_mod"] = self.eyebrows_expand_mod
         if self.seg_ie_polys is not None:
             d["seg_ie_polys"] = self.seg_ie_polys
         if self.arcface_embedding is not None:
             d["arcface_embedding"] = self.arcface_embedding.astype(np.float32).tolist()
+        if self.yaw is not None:
+            d["yaw"] = self.yaw
         return d
 
     @classmethod
@@ -71,9 +71,9 @@ class FaceMetadata:
         src_face_rect = data.get("source_face_rect")
         lm106_vis = data.get("landmarks_106_visibility", [True] * LANDMARK_POINTS)
         kps5_vis = data.get("kps_5_visibility", [True] * KPS5_POINTS)
-        eb_mod = data.get("eyebrows_expand_mod", 1.0)
         seg = data.get("seg_ie_polys")
         arcface = np.array(data["arcface_embedding"], dtype=np.float32) if "arcface_embedding" in data else None
+        yaw = data.get("yaw")
         return cls(
             landmarks_106=lm,
             face_type=ft,
@@ -86,9 +86,9 @@ class FaceMetadata:
             source_face_rect=src_face_rect,
             landmarks_106_visibility=lm106_vis,
             kps_5_visibility=kps5_vis,
-            eyebrows_expand_mod=eb_mod,
             seg_ie_polys=seg,
             arcface_embedding=arcface,
+            yaw=yaw,
         )
 
 
