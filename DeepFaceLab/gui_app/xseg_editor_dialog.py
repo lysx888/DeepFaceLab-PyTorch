@@ -825,6 +825,7 @@ class XSegEditorDialog(QDialog):
         self._annotated_count = 0
 
         self.setWindowTitle(f"XSeg 遮罩编辑器 — {self._aligned_dir.name}")
+        self.setMinimumSize(1300, 800)
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint)
         self._build_ui()
         self.showMaximized()

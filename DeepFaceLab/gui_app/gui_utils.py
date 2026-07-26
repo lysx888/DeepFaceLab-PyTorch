@@ -139,13 +139,21 @@ def save_face_annotation(
         face_path = existing_face_path
         existing_meta = MetadataManager.load(face_path)
         if existing_meta is not None:
-            if meta.arcface_embedding is None and existing_meta.arcface_embedding is not None:
+            if existing_meta.arcface_embedding is not None:
                 meta.arcface_embedding = existing_meta.arcface_embedding
-            if meta.seg_ie_polys is None and existing_meta.seg_ie_polys is not None:
+            if existing_meta.seg_ie_polys is not None:
                 meta.seg_ie_polys = existing_meta.seg_ie_polys
-            if existing_meta.eyebrows_expand_mod != 1.0 and meta.eyebrows_expand_mod == 1.0:
-                meta.eyebrows_expand_mod = existing_meta.eyebrows_expand_mod
+            if existing_meta.yaw is not None:
+                meta.yaw = existing_meta.yaw
     else:
+        from DeepFaceLab.business.face_extractor import _compute_yaw
+        try:
+            faces = adapter.detect_faces(aligned.image, max_num=1)
+            if faces and faces[0].embedding is not None:
+                meta.arcface_embedding = faces[0].embedding.astype(np.float32)
+        except Exception:
+            pass
+        meta.yaw = _compute_yaw(kps_5)
         ext = f".{output_format.lower().lstrip('.')}"
         stem = Path(source_filename).stem
         face_idx = 0

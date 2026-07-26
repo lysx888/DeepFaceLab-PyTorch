@@ -713,23 +713,25 @@ class _CompactThumbDelegate(QStyledItemDelegate):
 
 
 class _ThumbLoader(QThread):
-    thumb_loaded = pyqtSignal(int, QIcon, str, str)
+    thumb_loaded = pyqtSignal(int, object, str, str)
     loading_finished = pyqtSignal()
 
-    def __init__(self, image_paths: list[Path]):
+    def __init__(self, image_paths: list[Path], preload_count: int = 5):
         super().__init__()
         self._paths = image_paths
+        self._preload_count = preload_count
 
     def run(self):
         for i, img_path in enumerate(self._paths):
+            if i < self._preload_count:
+                continue
             img = cv2.imread(str(img_path))
             if img is None:
                 continue
             thumb = cv2.resize(img, (120, 80))
             rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
-            qimg = QImage(rgb.data, 120, 80, 3 * 120, QImage.Format.Format_RGB888)
-            pixmap = QPixmap.fromImage(qimg)
-            self.thumb_loaded.emit(i, QIcon(pixmap), img_path.stem, str(img_path))
+            qimg = QImage(rgb.data, 120, 80, 3 * 120, QImage.Format.Format_RGB888).copy()
+            self.thumb_loaded.emit(i, qimg, img_path.stem, str(img_path))
         self.loading_finished.emit()
 
 
@@ -1446,7 +1448,8 @@ class _FrameSelectDialog(QDialog):
         self._thumb_loader.thumb_loaded.connect(self._on_thumb_loaded)
         self._thumb_loader.start()
 
-    def _on_thumb_loaded(self, idx: int, icon: QIcon, stem: str, path_str: str):
+    def _on_thumb_loaded(self, idx: int, qimg: QImage, stem: str, path_str: str):
+        icon = QIcon(QPixmap.fromImage(qimg))
         if idx < self._thumb_list.count():
             item = self._thumb_list.item(idx)
             item.setIcon(icon)
@@ -1522,12 +1525,18 @@ class DebugPreviewDialog(QDialog):
         self._editing = False
         self._saving = False
         self.setWindowTitle("调试图预览 - " + ("源 (SRC)" if is_src else "目标 (DST)"))
-        self.setMinimumSize(1100, 700)
+        self.setMinimumSize(1300, 800)
         self.setWindowFlags(self.windowFlags() |
                             Qt.WindowType.WindowMinMaxButtonsHint |
                             Qt.WindowType.Window)
         self._build_ui()
         self._start_loading_thumbnails()
+        self.showMaximized()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, '_preview_label') and self._current_img is not None:
+            self._update_preview()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -1691,12 +1700,37 @@ class DebugPreviewDialog(QDialog):
             item.setSizeHint(QSize(126, 96))
             self._thumb_list.addItem(item)
 
-        self._thumb_loader = _ThumbLoader(images)
-        self._thumb_loader.thumb_loaded.connect(self._on_thumb_loaded)
-        self._thumb_loader.loading_finished.connect(self._on_thumbs_loaded)
-        self._thumb_loader.start()
+        preload = min(5, len(images))
+        for i in range(preload):
+            img = cv2.imread(str(images[i]))
+            if img is not None:
+                thumb = cv2.resize(img, (120, 80))
+                rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+                qimg = QImage(rgb.data, 120, 80, 3 * 120, QImage.Format.Format_RGB888)
+                pixmap = QPixmap.fromImage(qimg)
+                icon = QIcon(pixmap)
+                self._thumb_list.item(i).setIcon(icon)
+                self._cached_icons[i] = icon
 
-    def _on_thumb_loaded(self, idx: int, icon: QIcon, stem: str, path_str: str):
+        if preload > 0:
+            self._thumb_list.setCurrentRow(0)
+
+        if len(images) > preload:
+            self._thumb_loader = _ThumbLoader(images, preload_count=preload)
+            self._thumb_loader.thumb_loaded.connect(self._on_thumb_loaded)
+            self._thumb_loader.loading_finished.connect(self._on_thumbs_loaded)
+            self._thumb_loader.start()
+
+        if preload > 0:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(100, self._show_first_preview)
+
+    def _show_first_preview(self):
+        if self._thumb_list.count() > 0:
+            self._on_thumb_selected(self._thumb_list.currentItem(), None)
+
+    def _on_thumb_loaded(self, idx: int, qimg: QImage, stem: str, path_str: str):
+        icon = QIcon(QPixmap.fromImage(qimg))
         if idx < self._thumb_list.count():
             item = self._thumb_list.item(idx)
             item.setIcon(icon)
@@ -1705,8 +1739,7 @@ class DebugPreviewDialog(QDialog):
             self._cached_icons[idx] = icon
 
     def _on_thumbs_loaded(self):
-        if self._thumb_list.count() > 0:
-            self._thumb_list.setCurrentRow(0)
+        pass
 
     def _on_thumb_selected(self, current, previous):
         if current is None:
@@ -1844,6 +1877,10 @@ class DebugPreviewDialog(QDialog):
 
         self._stack.setCurrentIndex(1)
         self._editing = True
+        self._thumb_list.setEnabled(False)
+        self._prev_btn.setVisible(False)
+        self._next_btn.setVisible(False)
+        self._hthumb_btn.setVisible(False)
         self._edit_btn.setVisible(False)
         self._manual_btn.setVisible(False)
         self._save_btn.setVisible(True)
@@ -1986,6 +2023,10 @@ class DebugPreviewDialog(QDialog):
     def _exit_edit_mode(self):
         self._stack.setCurrentIndex(0)
         self._editing = False
+        self._thumb_list.setEnabled(True)
+        self._prev_btn.setVisible(True)
+        self._next_btn.setVisible(True)
+        self._hthumb_btn.setVisible(True)
         self._edit_btn.setVisible(True)
         self._manual_btn.setVisible(True)
         self._save_btn.setVisible(False)
