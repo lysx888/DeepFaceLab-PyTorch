@@ -92,6 +92,7 @@ TFM_PARAM_DEFS: list[ParamDef] = [
     ParamDef(key="window_size", label="窗口大小:", type=ParamType.STR, default="8", choices=["4", "8", "16"], group=ParamGroup.ARCHITECTURE),
     ParamDef(key="skip_strength", label="Skip强度:", type=ParamType.FLOAT, default=0.5, min_val=0.0, max_val=1.0, step=0.1, decimals=2, group=ParamGroup.ARCHITECTURE),
     ParamDef(key="gradient_checkpoint", label="梯度检查点", type=ParamType.BOOL, default=False, group=ParamGroup.ARCHITECTURE),
+    ParamDef(key="use_compile", label="torch.compile", type=ParamType.BOOL, default=False, group=ParamGroup.ARCHITECTURE),
     ParamDef(key="embed_dim", label="嵌入维度:", type=ParamType.INT, default=96, min_val=16, max_val=256, group=ParamGroup.ARCHITECTURE, preset_controlled=True),
     ParamDef(key="depths", label="块数:", type=ParamType.STR, default="[2,2,6,2]", group=ParamGroup.ARCHITECTURE, preset_controlled=True),
     ParamDef(key="num_heads", label="头数:", type=ParamType.STR, default="[3,6,12,24]", group=ParamGroup.ARCHITECTURE, preset_controlled=True),
