@@ -202,7 +202,6 @@ class TFMTrainer:
         face_style_power: float = 0.0,
         bg_style_power: float = 0.0,
         perceptual_weight: float = 0.0,
-        identity_weight: float = 0.0,
         uniform_yaw_sampling: bool = False,
         enable_mask: bool = True,
         save_interval_min: float = 15.0,
@@ -393,7 +392,6 @@ class TFMTrainer:
             "face_style_power": face_style_power,
             "bg_style_power": bg_style_power,
             "perceptual_weight": perceptual_weight,
-            "identity_weight": identity_weight,
             "uniform_yaw_sampling": uniform_yaw_sampling,
             "enable_mask": enable_mask,
             "save_interval_min": save_interval_min,
@@ -404,10 +402,6 @@ class TFMTrainer:
         if perceptual_weight > 0:
             from DeepFaceLab.models.tfm_model import VGGPerceptualLoss
             perceptual_loss_fn = VGGPerceptualLoss().to(device).eval()
-
-        identity_loss_adapter = None
-        if identity_weight > 0:
-            identity_loss_adapter = InsightFaceAdapter(ctx_id=0 if device.type == "cuda" else -1)
 
         lock_path = model_dir / ".training_lock"
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -436,7 +430,6 @@ class TFMTrainer:
                 "window_size": window_size,
                 "gan_power": gan_power,
                 "perceptual_weight": perceptual_weight,
-                "identity_weight": identity_weight,
                 "random_warp": random_warp,
                 "random_flip": random_flip,
                 "lr_schedule": lr_schedule,
@@ -542,11 +535,13 @@ class TFMTrainer:
                 loss_swap = _weighted_l1_loss(swap_recon, src_img, src_weight) + \
                             _weighted_l1_loss(swap_recon, dst_recon.detach(), dst_weight)
 
-                swap_rev = model.decode(src_w_plus, dst_id, src_enc_feat)
-                loss_swap_rev = _weighted_l1_loss(swap_rev, dst_img, dst_weight) + \
-                                _weighted_l1_loss(swap_rev, src_recon.detach(), src_weight)
+                loss = loss_src + loss_dst + loss_swap
 
-                loss = loss_src + loss_dst + loss_swap + loss_swap_rev
+                if iter_count % 5 == 0:
+                    swap_rev = model.decode(src_w_plus, dst_id, src_enc_feat)
+                    loss_swap_rev = _weighted_l1_loss(swap_rev, dst_img, dst_weight) + \
+                                    _weighted_l1_loss(swap_rev, src_recon.detach(), src_weight)
+                    loss = loss + loss_swap_rev
 
                 if face_style_power > 0 and enable_mask:
                     swap_face = swap_recon * dst_weight + dst_img * (1.0 - dst_weight)
@@ -560,30 +555,6 @@ class TFMTrainer:
                     loss = loss + perceptual_weight * perceptual_loss_fn(src_recon, src_img)
                     loss = loss + perceptual_weight * perceptual_loss_fn(dst_recon, dst_img)
                     loss = loss + perceptual_weight * perceptual_loss_fn(swap_recon, src_img)
-
-                if identity_weight > 0 and identity_loss_adapter is not None:
-                    swap_recon_rgb = ((swap_recon + 1.0) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
-                    src_recon_rgb = ((src_recon + 1.0) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
-                    dst_recon_rgb = ((dst_recon + 1.0) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
-                    swap_batch = swap_recon_rgb.permute(0, 2, 3, 1).cpu().numpy()
-                    src_r_batch = src_recon_rgb.permute(0, 2, 3, 1).cpu().numpy()
-                    dst_r_batch = dst_recon_rgb.permute(0, 2, 3, 1).cpu().numpy()
-                    for b in range(swap_batch.shape[0]):
-                        recon_faces = identity_loss_adapter.detect_faces(swap_batch[b], max_num=1)
-                        if recon_faces and recon_faces[0].embedding is not None:
-                            r_emb = torch.from_numpy(recon_faces[0].embedding).to(device)
-                            cos_sim = nn.functional.cosine_similarity(r_emb.unsqueeze(0), src_id[b:b+1])
-                            loss = loss + identity_weight * (1.0 - cos_sim)
-                        src_r_faces = identity_loss_adapter.detect_faces(src_r_batch[b], max_num=1)
-                        if src_r_faces and src_r_faces[0].embedding is not None:
-                            r_emb = torch.from_numpy(src_r_faces[0].embedding).to(device)
-                            cos_sim = nn.functional.cosine_similarity(r_emb.unsqueeze(0), src_id[b:b+1])
-                            loss = loss + identity_weight * 0.5 * (1.0 - cos_sim)
-                        dst_r_faces = identity_loss_adapter.detect_faces(dst_r_batch[b], max_num=1)
-                        if dst_r_faces and dst_r_faces[0].embedding is not None:
-                            r_emb = torch.from_numpy(dst_r_faces[0].embedding).to(device)
-                            cos_sim = nn.functional.cosine_similarity(r_emb.unsqueeze(0), dst_id[b:b+1])
-                            loss = loss + identity_weight * 0.5 * (1.0 - cos_sim)
 
                 if gan_power > 0 and model.discriminator is not None:
                     disc_real_src = model.discriminate(src_img)
