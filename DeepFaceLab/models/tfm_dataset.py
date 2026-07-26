@@ -22,12 +22,18 @@ class TFMDataset(Dataset):
         identity_cache: Optional[dict[str, np.ndarray]] = None,
         augment: bool = True,
         preload: bool = True,
+        random_hsv_power: float = 0.0,
+        random_warp: bool = True,
+        color_transfer: str = "none",
     ) -> None:
         self._aligned_dir = Path(aligned_dir)
         self._resolution = resolution
         self._is_src = is_src
         self._identity_cache = identity_cache or {}
         self._augment = augment
+        self._random_hsv_power = random_hsv_power
+        self._random_warp = random_warp
+        self._color_transfer = color_transfer
         self._image_paths: list[Path] = FileManager.find_images(self._aligned_dir)
         self._metadata_cache: dict[str, FaceMetadata] = MetadataManager.load_all(self._aligned_dir)
 
@@ -77,10 +83,20 @@ class TFMDataset(Dataset):
         else:
             identity_tensor = torch.zeros(512, dtype=torch.float32)
 
+        landmarks_tensor = torch.zeros(106, 2, dtype=torch.float32)
+        if meta is not None and meta.landmarks_106 is not None:
+            lm = meta.landmarks_106.astype(np.float32)
+            scale_x = self._resolution / meta.output_size if meta.output_size != self._resolution else 1.0
+            scale_y = self._resolution / meta.output_size if meta.output_size != self._resolution else 1.0
+            lm[:, 0] *= scale_x
+            lm[:, 1] *= scale_y
+            landmarks_tensor = torch.from_numpy(lm)
+
         return {
             "image": img_tensor,
             "mask": mask_tensor,
             "identity": identity_tensor,
+            "landmarks": landmarks_tensor,
         }
 
     def _render_mask(self, shape: tuple, meta: Optional[FaceMetadata]) -> np.ndarray:
@@ -110,14 +126,33 @@ class TFMDataset(Dataset):
             img = np.fliplr(img).copy()
             mask = np.fliplr(mask).copy()
 
-        angle = np.random.uniform(-15, 15)
-        scale = np.random.uniform(0.9, 1.1)
-        h, w = img.shape[:2]
-        M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, scale)
-        img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
-        mask = cv2.warpAffine(mask, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+        if self._random_warp:
+            angle = np.random.uniform(-10, 10)
+            tx = np.random.uniform(-5, 5)
+            ty = np.random.uniform(-5, 5)
+            scale = np.random.uniform(0.95, 1.05)
+            h, w = img.shape[:2]
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, scale)
+            M[:, 2] += [tx, ty]
+            img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+            mask = cv2.warpAffine(mask, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+        else:
+            angle = np.random.uniform(-15, 15)
+            scale = np.random.uniform(0.9, 1.1)
+            h, w = img.shape[:2]
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, scale)
+            img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+            mask = cv2.warpAffine(mask, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
 
-        if np.random.random() < 0.3:
+        if self._random_hsv_power > 0:
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+            h_shift = np.random.uniform(-10, 10) * self._random_hsv_power
+            s_scale = 1.0 + np.random.uniform(-0.2, 0.2) * self._random_hsv_power
+            hsv[:, :, 0] += h_shift
+            hsv[:, :, 1] *= s_scale
+            hsv = np.clip(hsv, [0, 0, 0], [179, 255, 255]).astype(np.uint8)
+            img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        elif np.random.random() < 0.3:
             hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
             hsv[:, :, 0] += np.random.uniform(-10, 10)
             hsv[:, :, 1] *= np.random.uniform(0.8, 1.2)
@@ -128,7 +163,29 @@ class TFMDataset(Dataset):
             ksize = np.random.choice([3, 5])
             img = cv2.GaussianBlur(img, (ksize, ksize), 0)
 
+        if self._color_transfer == "rct":
+            img = self._color_transfer_rct(img)
+        elif self._color_transfer == "mkl":
+            img = self._color_transfer_mkl(img)
+
         return img, mask
+
+    @staticmethod
+    def _color_transfer_rct(img: np.ndarray) -> np.ndarray:
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float64)
+        l, a, b = cv2.split(lab)
+        l_mean, l_std = l.mean(), l.std() + 1e-6
+        a_mean, a_std = a.mean(), a.std() + 1e-6
+        b_mean, b_std = b.mean(), b.std() + 1e-6
+        l = (l - l_mean) / l_std * 50 + 128
+        a = (a - a_mean) / a_std * 50 + 128
+        b = (b - b_mean) / b_std * 50 + 128
+        lab = cv2.merge([np.clip(l, 0, 255), np.clip(a, 0, 255), np.clip(b, 0, 255)]).astype(np.uint8)
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    @staticmethod
+    def _color_transfer_mkl(img: np.ndarray) -> np.ndarray:
+        return img
 
     @staticmethod
     def build_identity_cache(

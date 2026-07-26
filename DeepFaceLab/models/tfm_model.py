@@ -337,12 +337,14 @@ class TFMDecoder(nn.Module):
         base_channels: int = 512,
         encoder_dims: Optional[list[int]] = None,
         gradient_checkpoint: bool = False,
+        skip_strength: float = 0.5,
     ) -> None:
         super().__init__()
         self.resolution = resolution
         self.w_dim = w_dim
         self.num_layers = 7 if resolution >= 256 else 6
         self.gradient_checkpoint = gradient_checkpoint
+        self.skip_strength = skip_strength
 
         if encoder_dims is None:
             encoder_dims = [96, 192, 384, 768]
@@ -405,7 +407,7 @@ class TFMDecoder(nn.Module):
                     if skip.shape[2:] != (target_h, target_w):
                         skip = F.interpolate(skip, size=(target_h, target_w), mode="bilinear", align_corners=False)
 
-            x = layer(x, identity_embed, w_style, skip)
+            x = layer(x, identity_embed, w_style, skip * self.skip_strength if skip is not None else None)
             rgb_up = self.to_rgb_layers[i + 1](x)
             if rgb.shape[2:] != rgb_up.shape[2:]:
                 rgb = F.interpolate(rgb, size=rgb_up.shape[2:], mode="bilinear", align_corners=False)
@@ -516,6 +518,7 @@ class TFMModel(nn.Module):
         base_channels: int = 512,
         drop_rate: float = 0.1,
         gradient_checkpoint: bool = False,
+        skip_strength: float = 0.5,
     ) -> None:
         super().__init__()
         if depths is None:
@@ -563,6 +566,7 @@ class TFMModel(nn.Module):
             base_channels=base_channels,
             encoder_dims=encoder_dims,
             gradient_checkpoint=gradient_checkpoint,
+            skip_strength=skip_strength,
         )
 
         self.discriminator = None
