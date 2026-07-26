@@ -21,6 +21,7 @@ class TFMDataset(Dataset):
         is_src: bool = True,
         identity_cache: Optional[dict[str, np.ndarray]] = None,
         augment: bool = True,
+        preload: bool = True,
     ) -> None:
         self._aligned_dir = Path(aligned_dir)
         self._resolution = resolution
@@ -29,6 +30,14 @@ class TFMDataset(Dataset):
         self._augment = augment
         self._image_paths: list[Path] = FileManager.find_images(self._aligned_dir)
         self._metadata_cache: dict[str, FaceMetadata] = MetadataManager.load_all(self._aligned_dir)
+
+        self._image_cache: dict[str, np.ndarray] = {}
+        if preload and len(self._image_paths) <= 2000:
+            for p in self._image_paths:
+                img = cv2.imread(str(p))
+                if img is not None:
+                    self._image_cache[p.name] = img
+            _logger.info(f"TFMDataset ({'src' if is_src else 'dst'}): preloaded {len(self._image_cache)}/{len(self._image_paths)} images into memory")
 
         if not self._image_paths:
             raise ValueError(f"No face images found in {self._aligned_dir}")
@@ -40,7 +49,9 @@ class TFMDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         img_path = self._image_paths[idx]
-        img = cv2.imread(str(img_path))
+        img = self._image_cache.get(img_path.name)
+        if img is None:
+            img = cv2.imread(str(img_path))
         if img is None:
             img = np.zeros((self._resolution, self._resolution, 3), dtype=np.uint8)
 

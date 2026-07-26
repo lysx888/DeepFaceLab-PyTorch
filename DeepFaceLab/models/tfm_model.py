@@ -26,14 +26,11 @@ class PatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.patches_resolution = img_size // patch_size
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        self.norm = nn.LayerNorm(embed_dim)
+        self.norm = nn.GroupNorm(1, embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
-        B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)
         x = self.norm(x)
-        x = x.transpose(1, 2).reshape(B, C, H, W)
         return x
 
 
@@ -91,23 +88,33 @@ class SwinTransformerBlock(nn.Module):
         relative_position_index = relative_coords.sum(-1)
         self.register_buffer("relative_position_index", relative_position_index)
 
+        N = window_size * window_size
+        index_flat = relative_position_index.reshape(-1)
+        bias_index = torch.zeros(num_heads, N, N, dtype=torch.long)
+        for h_idx in range(num_heads):
+            bias_index[h_idx] = index_flat + h_idx * index_flat.numel() // num_heads
+        self.register_buffer("_bias_index", index_flat)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         shortcut = x
         x_flat = x.flatten(2).transpose(1, 2)
         x_flat = self.norm1(x_flat)
-        x = x_flat.transpose(1, 2).reshape(B, C, H, W)
 
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         if pad_r > 0 or pad_b > 0:
-            x = F.pad(x, (0, pad_r, 0, pad_b))
-        _, _, Hp, Wp = x.shape
+            x_nchw = x_flat.transpose(1, 2).reshape(B, C, H, W)
+            x_nchw = F.pad(x_nchw, (0, pad_r, 0, pad_b))
+            _, _, Hp, Wp = x_nchw.shape
+        else:
+            Hp, Wp = H, W
+            x_nchw = x_flat.transpose(1, 2).reshape(B, C, Hp, Wp)
 
         if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(2, 3))
+            shifted_x = torch.roll(x_nchw, shifts=(-self.shift_size, -self.shift_size), dims=(2, 3))
         else:
-            shifted_x = x
+            shifted_x = x_nchw
 
         x_windows = _window_partition(shifted_x, self.window_size)
         x_windows = x_windows.reshape(-1, self.window_size * self.window_size, C)
@@ -118,8 +125,7 @@ class SwinTransformerBlock(nn.Module):
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
 
-        index = self.relative_position_index.reshape(-1)
-        rel_pos_bias = self.relative_position_bias_table[index]
+        rel_pos_bias = self.relative_position_bias_table[self._bias_index]
         rel_pos_bias = rel_pos_bias.reshape(N, N, -1).permute(2, 0, 1).unsqueeze(0)
         attn = attn + rel_pos_bias
 
@@ -150,8 +156,8 @@ class SwinTransformerBlock(nn.Module):
 class PatchMerging(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(4 * dim)
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.norm = nn.GroupNorm(1, 4 * dim)
+        self.reduction = nn.Conv2d(4 * dim, 2 * dim, 1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -160,9 +166,8 @@ class PatchMerging(nn.Module):
         x2 = x[:, :, 0::2, 1::2]
         x3 = x[:, :, 1::2, 1::2]
         x = torch.cat([x0, x1, x2, x3], dim=1)
-        x = x.flatten(2).transpose(1, 2)
-        x = self.reduction(self.norm(x))
-        x = x.transpose(1, 2).reshape(B, 2 * C, H // 2, W // 2)
+        x = self.norm(x)
+        x = self.reduction(x)
         return x
 
 
@@ -177,6 +182,7 @@ class TFMEncoder(nn.Module):
         num_heads: Optional[list[int]] = None,
         window_size: int = 8,
         drop_rate: float = 0.1,
+        gradient_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         if depths is None:
@@ -189,6 +195,7 @@ class TFMEncoder(nn.Module):
         self.num_heads = num_heads
         self.window_size = window_size
         self.num_stages = len(depths)
+        self.gradient_checkpoint = gradient_checkpoint
 
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
 
@@ -214,13 +221,22 @@ class TFMEncoder(nn.Module):
                 self.downsample.append(PatchMerging(dim))
             dim *= 2
 
+    def _run_stage(self, stage_blocks: nn.ModuleList, x: torch.Tensor) -> torch.Tensor:
+        for block in stage_blocks:
+            x = block(x)
+        return x
+
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         x = self.patch_embed(x)
         features = {}
         dim = self.embed_dim
         for i in range(self.num_stages):
-            for block in self.stages[i]:
-                x = block(x)
+            if self.gradient_checkpoint and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    self._run_stage, self.stages[i], x, use_reentrant=False
+                )
+            else:
+                x = self._run_stage(self.stages[i], x)
             features[f"stage{i + 1}"] = x
             if i < self.num_stages - 1:
                 x = self.downsample[i](x)
@@ -325,11 +341,13 @@ class TFMDecoder(nn.Module):
         identity_dim: int = 512,
         base_channels: int = 512,
         encoder_dims: Optional[list[int]] = None,
+        gradient_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         self.resolution = resolution
         self.w_dim = w_dim
         self.num_layers = 7 if resolution >= 256 else 6
+        self.gradient_checkpoint = gradient_checkpoint
 
         if encoder_dims is None:
             encoder_dims = [96, 192, 384, 768]
@@ -502,6 +520,7 @@ class TFMModel(nn.Module):
         gan_power: float = 0.0,
         base_channels: int = 512,
         drop_rate: float = 0.1,
+        gradient_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         if depths is None:
@@ -519,6 +538,7 @@ class TFMModel(nn.Module):
         self.identity_dim = identity_dim
         self.gan_power = gan_power
         self.base_channels = base_channels
+        self.gradient_checkpoint = gradient_checkpoint
 
         self.encoder = TFMEncoder(
             img_size=resolution,
@@ -527,6 +547,7 @@ class TFMModel(nn.Module):
             num_heads=num_heads,
             window_size=window_size,
             drop_rate=drop_rate,
+            gradient_checkpoint=gradient_checkpoint,
         )
 
         last_dim = embed_dim * (2 ** (len(depths) - 1))
@@ -546,6 +567,7 @@ class TFMModel(nn.Module):
             identity_dim=identity_dim,
             base_channels=base_channels,
             encoder_dims=encoder_dims,
+            gradient_checkpoint=gradient_checkpoint,
         )
 
         self.discriminator = None
@@ -661,7 +683,7 @@ class TFMModel(nn.Module):
         }
 
     @classmethod
-    def from_preset(cls, preset: str = "medium", resolution: int = 128, gan_power: float = 0.0, window_size: int = 8, identity_dim: int = 512, **kwargs) -> "TFMModel":
+    def from_preset(cls, preset: str = "medium", resolution: int = 128, gan_power: float = 0.0, window_size: int = 8, identity_dim: int = 512, gradient_checkpoint: bool = False, **kwargs) -> "TFMModel":
         if preset not in _TFM_PRESETS:
             raise ValueError(f"Unknown preset: {preset}. Available: {list(_TFM_PRESETS.keys())}")
         cfg = _TFM_PRESETS[preset]
@@ -675,5 +697,6 @@ class TFMModel(nn.Module):
             identity_dim=identity_dim,
             gan_power=gan_power,
             base_channels=cfg["base_channels"],
+            gradient_checkpoint=gradient_checkpoint,
             **kwargs,
         )
