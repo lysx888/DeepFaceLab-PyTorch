@@ -402,13 +402,15 @@ class TFMTrainer:
             dst_id = dst_batch["identity"].to(device, non_blocking=get_non_blocking())
 
             with torch.amp.autocast(device.type, enabled=(use_amp and device.type == "cuda")):
-                src_recon = model(src_img, src_id)
+                src_enc_feat, src_w_plus = model.encode(src_img)
+                src_recon = model.decode(src_w_plus, src_id, src_enc_feat)
                 loss_src = nn.functional.l1_loss(src_recon, src_img)
 
-                dst_recon = model(dst_img, dst_id)
+                dst_enc_feat, dst_w_plus = model.encode(dst_img)
+                dst_recon = model.decode(dst_w_plus, dst_id, dst_enc_feat)
                 loss_dst = nn.functional.l1_loss(dst_recon, dst_img)
 
-                swap_recon = model(dst_img, src_id)
+                swap_recon = model.decode(dst_w_plus, src_id, dst_enc_feat)
                 loss_swap_src = nn.functional.l1_loss(swap_recon, src_img)
                 loss_swap_dst = nn.functional.l1_loss(swap_recon, dst_recon.detach())
 
