@@ -45,6 +45,26 @@ class TFMDataset(Dataset):
                     self._image_cache[p.name] = img
             _logger.info(f"TFMDataset ({'src' if is_src else 'dst'}): preloaded {len(self._image_cache)}/{len(self._image_paths)} images into memory")
 
+        self._mask_cache: dict[str, np.ndarray] = {}
+        for p in self._image_paths:
+            meta = self._metadata_cache.get(p.name)
+            if meta is not None and meta.seg_ie_polys is not None:
+                img = self._image_cache.get(p.name)
+                if img is None:
+                    img = cv2.imread(str(p))
+                if img is not None:
+                    self._mask_cache[p.name] = self._render_mask_from_polys(img.shape[:2], meta)
+        if self._mask_cache:
+            _logger.info(f"TFMDataset ({'src' if is_src else 'dst'}): pre-rendered {len(self._mask_cache)} masks")
+
+        self._image_cache: dict[str, np.ndarray] = {}
+        if preload and len(self._image_paths) <= 2000:
+            for p in self._image_paths:
+                img = cv2.imread(str(p))
+                if img is not None:
+                    self._image_cache[p.name] = img
+            _logger.info(f"TFMDataset ({'src' if is_src else 'dst'}): preloaded {len(self._image_cache)}/{len(self._image_paths)} images into memory")
+
         if not self._image_paths:
             raise ValueError(f"No face images found in {self._aligned_dir}")
 
@@ -62,7 +82,9 @@ class TFMDataset(Dataset):
             img = np.zeros((self._resolution, self._resolution, 3), dtype=np.uint8)
 
         meta = self._metadata_cache.get(img_path.name)
-        mask = self._render_mask(img.shape[:2], meta)
+        mask = self._mask_cache.get(img_path.name)
+        if mask is None:
+            mask = np.ones(img.shape[:2], dtype=np.uint8) * 255
 
         if self._augment:
             img, mask = self._augment_pair(img, mask)
@@ -104,10 +126,11 @@ class TFMDataset(Dataset):
             "yaw": torch.tensor(yaw_val, dtype=torch.float32),
         }
 
-    def _render_mask(self, shape: tuple, meta: Optional[FaceMetadata]) -> np.ndarray:
+    @staticmethod
+    def _render_mask_from_polys(shape: tuple, meta: FaceMetadata) -> np.ndarray:
         h, w = shape[:2]
         mask = np.ones((h, w), dtype=np.uint8) * 255
-        if meta is None or meta.seg_ie_polys is None:
+        if meta.seg_ie_polys is None:
             return mask
         for poly_data in meta.seg_ie_polys:
             pts_data = poly_data.get("pts", [])
