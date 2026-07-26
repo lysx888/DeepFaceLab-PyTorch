@@ -446,7 +446,9 @@ class TFMTrainer:
                 "random_hsv_power": random_hsv_power,
                 "color_transfer": color_transfer,
                 "uniform_yaw_sampling": uniform_yaw_sampling,
+                "enable_mask": enable_mask,
                 "save_interval_min": save_interval_min,
+                "preview_interval_sec": preview_interval_sec,
             },
             device_info=device_info,
         )
