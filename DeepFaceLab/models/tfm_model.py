@@ -556,6 +556,15 @@ class TFMModel(nn.Module):
         result, _ = self.forward_with_features(img, identity_embed)
         return result
 
+    def encode(self, img: torch.Tensor) -> tuple[dict, torch.Tensor]:
+        encoder_features = self.encoder(img)
+        stage4_feat = encoder_features[f"stage{len(self.depths)}"]
+        w_plus = self.wplus_mapper(stage4_feat)
+        return encoder_features, w_plus
+
+    def decode(self, w_plus: torch.Tensor, identity_embed: torch.Tensor, encoder_features: dict) -> torch.Tensor:
+        return self.decoder(w_plus, identity_embed, encoder_features)
+
     def forward_with_features(
         self,
         img: torch.Tensor,
