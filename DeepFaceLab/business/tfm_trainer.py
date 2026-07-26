@@ -31,6 +31,62 @@ _MODEL_PREFIX = "TFM"
 _SAVE_INTERVAL_SEC = 1200
 _PREVIEW_INTERVAL_SEC = 60
 
+_LANDMARK_EYE_R = [35, 41, 40, 42, 39, 37, 33, 36]
+_LANDMARK_EYE_L = [93, 96, 94, 95, 89, 90, 87, 91]
+_LANDMARK_NOSE = [72, 73, 74, 86, 75, 76, 77, 78, 79, 80, 85, 84, 83, 82, 81]
+_LANDMARK_MOUTH = [52, 64, 63, 71, 67, 68, 61, 58, 59, 53, 56, 55, 65, 66, 62, 70, 69, 57, 60, 54]
+_LANDMARK_JAW = [1,9,10,11,12,13,14,15,16,2,3,4,5,6,7,8,0,24,23,22,21,20,19,18,32,31,30,29,28,27,26,25,17]
+
+
+def _gaussian_2d(shape: tuple[int, int], center: tuple[float, float], sigma: float) -> np.ndarray:
+    h, w = shape
+    y, x = np.mgrid[0:h, 0:w]
+    d2 = (x - center[0]) ** 2 + (y - center[1]) ** 2
+    return np.exp(-d2 / (2 * sigma * sigma))
+
+
+def _build_region_weight_map(
+    resolution: int,
+    landmarks: np.ndarray,
+    eye_priority: float = 1.0,
+    mouth_priority: float = 1.0,
+    nose_priority: float = 1.0,
+    jaw_priority: float = 1.0,
+) -> np.ndarray:
+    wmap = np.ones((resolution, resolution), dtype=np.float32)
+    if landmarks is None or landmarks.max() == 0:
+        return wmap
+    sigma = resolution / 16.0
+
+    def _add_region(indices, priority):
+        nonlocal wmap
+        if priority <= 1.0:
+            return
+        pts = landmarks[indices]
+        valid = pts[(pts[:, 0] > 0) & (pts[:, 1] > 0)]
+        if len(valid) == 0:
+            return
+        center = valid.mean(axis=0).astype(np.float64)
+        g = _gaussian_2d((resolution, resolution), (center[0], center[1]), sigma)
+        wmap += (priority - 1.0) * g
+
+    _add_region(_LANDMARK_EYE_R + _LANDMARK_EYE_L, eye_priority)
+    _add_region(_LANDMARK_MOUTH, mouth_priority)
+    _add_region(_LANDMARK_NOSE, nose_priority)
+    _add_region(_LANDMARK_JAW, jaw_priority)
+    return wmap
+
+
+def _weighted_l1_loss(pred: torch.Tensor, target: torch.Tensor, weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
+    if weight_map is None:
+        return nn.functional.l1_loss(pred, target)
+    diff = (pred - target).abs()
+    if diff.shape[1] == 3 and weight_map.shape[1] == 1:
+        diff = diff * weight_map
+    else:
+        diff = diff * weight_map
+    return diff.mean()
+
 
 def _progress_bar(current: int, total: int, width: int = 40) -> str:
     pct = current / max(total, 1)
@@ -148,6 +204,7 @@ class TFMTrainer:
         perceptual_weight: float = 0.0,
         identity_weight: float = 0.0,
         uniform_yaw_sampling: bool = False,
+        enable_mask: bool = True,
         save_interval_min: float = 15.0,
         preview_interval_sec: float = 60,
         on_iter: Optional[Callable[[int, float, float], None]] = None,
@@ -225,15 +282,42 @@ class TFMTrainer:
             model_dir.mkdir(parents=True, exist_ok=True)
             TFMDataset.save_identity_cache(dst_id_cache, dst_cache_path)
 
-        src_ds = TFMDataset(src_dir, resolution=resolution, is_src=True, identity_cache=src_id_cache, augment=True)
-        dst_ds = TFMDataset(dst_dir, resolution=resolution, is_src=False, identity_cache=dst_id_cache, augment=True)
+        src_ds = TFMDataset(src_dir, resolution=resolution, is_src=True, identity_cache=src_id_cache, augment=True, random_hsv_power=random_hsv_power, random_warp=random_warp, color_transfer=color_transfer)
+        dst_ds = TFMDataset(dst_dir, resolution=resolution, is_src=False, identity_cache=dst_id_cache, augment=True, random_hsv_power=random_hsv_power, random_warp=random_warp, color_transfer=color_transfer)
 
         dl_cfg = get_dataloader_config("gpu_train" if device.type == "cuda" else "cpu_train", dataset_size=len(src_ds) + len(dst_ds))
+
+        def _make_yaw_sampler(dataset):
+            if not uniform_yaw_sampling:
+                return RandomSampler(dataset, replacement=True, num_samples=max(len(dataset), batch_size * 50))
+            yaws = []
+            for i in range(len(dataset)):
+                meta = dataset._metadata_cache.get(dataset._image_paths[i].name)
+                if meta is not None and meta.landmarks_106 is not None:
+                    lm = meta.landmarks_106.astype(np.float64)
+                    left_eye = lm[88:93].mean(axis=0)
+                    right_eye = lm[34:39].mean(axis=0)
+                    nose = lm[86]
+                    eye_mid = (left_eye + right_eye) / 2
+                    yaw = abs(nose[0] - eye_mid[0]) / max(abs(left_eye[0] - right_eye[0]), 1)
+                    yaws.append(yaw)
+                else:
+                    yaws.append(0.5)
+            yaws = np.array(yaws)
+            bins = np.linspace(0, yaws.max() + 1e-6, 11)
+            bin_idx = np.digitize(yaws, bins) - 1
+            bin_counts = np.bincount(bin_idx, minlength=10).astype(np.float64)
+            bin_weights = 1.0 / (bin_counts + 1)
+            sample_weights = torch.from_numpy(bin_weights[bin_idx]).float()
+            return torch.utils.data.WeightedRandomSampler(sample_weights, num_samples=max(len(dataset), batch_size * 50), replacement=True)
+
+        src_sampler = _make_yaw_sampler(src_ds)
+        dst_sampler = _make_yaw_sampler(dst_ds)
 
         src_loader = DataLoader(
             src_ds,
             batch_size=batch_size,
-            sampler=RandomSampler(src_ds, replacement=True, num_samples=max(len(src_ds), batch_size * 50)),
+            sampler=src_sampler,
             num_workers=dl_cfg["num_workers"],
             pin_memory=dl_cfg["pin_memory"],
             drop_last=True,
@@ -244,7 +328,7 @@ class TFMTrainer:
         dst_loader = DataLoader(
             dst_ds,
             batch_size=batch_size,
-            sampler=RandomSampler(dst_ds, replacement=True, num_samples=max(len(dst_ds), batch_size * 50)),
+            sampler=dst_sampler,
             num_workers=dl_cfg["num_workers"],
             pin_memory=dl_cfg["pin_memory"],
             drop_last=True,
@@ -311,6 +395,7 @@ class TFMTrainer:
             "perceptual_weight": perceptual_weight,
             "identity_weight": identity_weight,
             "uniform_yaw_sampling": uniform_yaw_sampling,
+            "enable_mask": enable_mask,
             "save_interval_min": save_interval_min,
             "preview_interval_sec": preview_interval_sec,
         })
@@ -419,23 +504,53 @@ class TFMTrainer:
 
             src_img = src_batch["image"].to(device, non_blocking=get_non_blocking()).to(memory_format=torch.channels_last)
             src_id = src_batch["identity"].to(device, non_blocking=get_non_blocking())
+            src_mask = src_batch["mask"].to(device, non_blocking=get_non_blocking())
+            src_lm = src_batch["landmarks"]
             dst_img = dst_batch["image"].to(device, non_blocking=get_non_blocking()).to(memory_format=torch.channels_last)
             dst_id = dst_batch["identity"].to(device, non_blocking=get_non_blocking())
+            dst_mask = dst_batch["mask"].to(device, non_blocking=get_non_blocking())
+            dst_lm = dst_batch["landmarks"]
+
+            src_weight = torch.ones_like(src_mask)
+            dst_weight = torch.ones_like(dst_mask)
+            if enable_mask:
+                src_weight = src_mask
+                dst_weight = dst_mask
+            need_region_weight = (eye_priority > 1.0 or mouth_priority > 1.0 or nose_priority > 1.0 or jaw_priority > 1.0)
+            if need_region_weight:
+                src_wmap_np = np.stack([
+                    _build_region_weight_map(resolution, src_lm[b].numpy(), eye_priority, mouth_priority, nose_priority, jaw_priority)
+                    for b in range(src_lm.shape[0])
+                ])
+                src_weight = src_weight * torch.from_numpy(src_wmap_np).unsqueeze(1).to(device)
+                dst_wmap_np = np.stack([
+                    _build_region_weight_map(resolution, dst_lm[b].numpy(), eye_priority, mouth_priority, nose_priority, jaw_priority)
+                    for b in range(dst_lm.shape[0])
+                ])
+                dst_weight = dst_weight * torch.from_numpy(dst_wmap_np).unsqueeze(1).to(device)
 
             with torch.amp.autocast(device.type, enabled=(use_amp and device.type == "cuda")):
                 src_enc_feat, src_w_plus = model.encode(src_img)
                 src_recon = model.decode(src_w_plus, src_id, src_enc_feat)
-                loss_src = nn.functional.l1_loss(src_recon, src_img)
+                loss_src = _weighted_l1_loss(src_recon, src_img, src_weight)
 
                 dst_enc_feat, dst_w_plus = model.encode(dst_img)
                 dst_recon = model.decode(dst_w_plus, dst_id, dst_enc_feat)
-                loss_dst = nn.functional.l1_loss(dst_recon, dst_img)
+                loss_dst = _weighted_l1_loss(dst_recon, dst_img, dst_weight)
 
                 swap_recon = model.decode(dst_w_plus, src_id, dst_enc_feat)
-                loss_swap_src = nn.functional.l1_loss(swap_recon, src_img)
-                loss_swap_dst = nn.functional.l1_loss(swap_recon, dst_recon.detach())
+                loss_swap_src = _weighted_l1_loss(swap_recon, src_img, src_weight)
+                loss_swap_dst = _weighted_l1_loss(swap_recon, dst_recon.detach(), dst_weight)
 
                 loss = loss_src + loss_dst + 0.5 * loss_swap_src + 0.5 * loss_swap_dst
+
+                if face_style_power > 0 and enable_mask:
+                    swap_face = swap_recon * dst_weight + dst_img * (1.0 - dst_weight)
+                    loss = loss + face_style_power * _weighted_l1_loss(swap_recon, swap_face.detach(), dst_weight)
+
+                if bg_style_power > 0 and enable_mask:
+                    swap_bg = swap_recon * (1.0 - dst_weight) + dst_img * dst_weight
+                    loss = loss + bg_style_power * _weighted_l1_loss(swap_recon, swap_bg.detach(), 1.0 - dst_weight)
 
                 if perceptual_weight > 0 and perceptual_loss_fn is not None:
                     loss = loss + perceptual_weight * perceptual_loss_fn(src_recon, src_img)
@@ -455,8 +570,12 @@ class TFMTrainer:
                 if gan_power > 0 and model.discriminator is not None:
                     disc_real_src = model.discriminate(src_img)
                     disc_fake_src = model.discriminate(src_recon.detach())
+                    disc_real_dst = model.discriminate(dst_img)
+                    disc_fake_swap = model.discriminate(swap_recon.detach())
                     disc_loss = nn.functional.binary_cross_entropy_with_logits(disc_real_src, torch.ones_like(disc_real_src)) + \
-                                nn.functional.binary_cross_entropy_with_logits(disc_fake_src, torch.zeros_like(disc_fake_src))
+                                nn.functional.binary_cross_entropy_with_logits(disc_fake_src, torch.zeros_like(disc_fake_src)) + \
+                                nn.functional.binary_cross_entropy_with_logits(disc_real_dst, torch.ones_like(disc_real_dst)) + \
+                                nn.functional.binary_cross_entropy_with_logits(disc_fake_swap, torch.zeros_like(disc_fake_swap))
 
                     if disc_optimizer is not None:
                         disc_optimizer.zero_grad()
