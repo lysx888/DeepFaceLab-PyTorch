@@ -88,12 +88,7 @@ class SwinTransformerBlock(nn.Module):
         relative_position_index = relative_coords.sum(-1)
         self.register_buffer("relative_position_index", relative_position_index)
 
-        N = window_size * window_size
-        index_flat = relative_position_index.reshape(-1)
-        bias_index = torch.zeros(num_heads, N, N, dtype=torch.long)
-        for h_idx in range(num_heads):
-            bias_index[h_idx] = index_flat + h_idx * index_flat.numel() // num_heads
-        self.register_buffer("_bias_index", index_flat)
+        self.register_buffer("_bias_index", relative_position_index.reshape(-1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
