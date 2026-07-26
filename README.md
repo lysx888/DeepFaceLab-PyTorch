@@ -7,11 +7,11 @@
 # **目前进度**
 已经完成了视频分割，人脸提取，遮罩相关，目前正在调试模型训练
 # **项目展示**
-![DeepFaceLab-PyTorch](https://github.com/lysx888/DeepFaceLab-PyTorch/blob/main/DeepFaceLab/doc/1.png)
-![DeepFaceLab-PyTorch](https://github.com/lysx888/DeepFaceLab-PyTorch/blob/main/DeepFaceLab/doc/2.png)
-![DeepFaceLab-PyTorch](https://github.com/lysx888/DeepFaceLab-PyTorch/blob/main/DeepFaceLab/doc/3.png)
-![DeepFaceLab-PyTorch](https://github.com/lysx888/DeepFaceLab-PyTorch/blob/main/DeepFaceLab/doc/4.png)
-![DeepFaceLab-PyTorch](https://github.com/lysx888/DeepFaceLab-PyTorch/blob/main/DeepFaceLab/doc/5.png)
-![DeepFaceLab-PyTorch](https://github.com/lysx888/DeepFaceLab-PyTorch/blob/main/DeepFaceLab/doc/6.png)
-![DeepFaceLab-PyTorch](https://github.com/lysx888/DeepFaceLab-PyTorch/blob/main/DeepFaceLab/doc/7.png)
-![DeepFaceLab-PyTorch](https://github.com/lysx888/DeepFaceLab-PyTorch/blob/main/DeepFaceLab/doc/8.png)
+![DeepFaceLab-PyTorch](https://raw.githubusercontent.com/lysx888/DeepFaceLab-PyTorch/refs/heads/main/docs/1.png)
+![DeepFaceLab-PyTorch](https://raw.githubusercontent.com/lysx888/DeepFaceLab-PyTorch/refs/heads/main/docs/2.png)
+![DeepFaceLab-PyTorch](https://raw.githubusercontent.com/lysx888/DeepFaceLab-PyTorch/refs/heads/main/docs/3.png)
+![DeepFaceLab-PyTorch](https://raw.githubusercontent.com/lysx888/DeepFaceLab-PyTorch/refs/heads/main/docs/4.png)
+![DeepFaceLab-PyTorch](https://raw.githubusercontent.com/lysx888/DeepFaceLab-PyTorch/refs/heads/main/docs/5.png)
+![DeepFaceLab-PyTorch](https://raw.githubusercontent.com/lysx888/DeepFaceLab-PyTorch/refs/heads/main/docs/6.png)
+![DeepFaceLab-PyTorch](https://raw.githubusercontent.com/lysx888/DeepFaceLab-PyTorch/refs/heads/main/docs/7.png)
+![DeepFaceLab-PyTorch](https://raw.githubusercontent.com/lysx888/DeepFaceLab-PyTorch/refs/heads/main/docs/8.png)
