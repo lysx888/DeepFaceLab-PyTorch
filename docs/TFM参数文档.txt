@@ -1,0 +1,432 @@
+================================================================================
+                    TFM (Transformer Face Model) 参数文档
+================================================================================
+
+一、换脸原理
+================================================================================
+
+TFM的核心思想是"身份与表情解耦"：
+
+  编码器(Swin Transformer) → 提取表情/姿态特征 + W+风格向量
+  身份嵌入(ArcFace 512维) → 提取身份特征（谁的脸）
+  解码器(StyleGAN2) → 根据W+风格 + 身份嵌入 → 生成人脸
+
+【训练流程】（tfm_trainer.py L425-438）
+
+  1. 自重建SRC：encode(src_img) → decode(src_w+, src_id, src_enc_feat) ≈ src_img
+     目的：让模型学会重建SRC人脸
+
+  2. 自重建DST：encode(dst_img) → decode(dst_w+, dst_id, dst_enc_feat) ≈ dst_img
+     目的：让模型学会重建DST人脸
+
+  3. 交叉换脸：decode(dst_w+, src_id, dst_enc_feat) → 换脸结果
+     关键：用DST的表情/姿态(dst_w+, dst_enc_feat) + SRC的身份(src_id)
+     结果应该：看起来像SRC的脸，但保持DST的表情和姿态
+
+【推理流程】（tfm_trainer.py _preview_row_dfl L604-615）
+
+  sd_recon = model(d_img_t, s_id)
+  即：encode(dst_img)获取dst特征，然后decode时注入src_id
+  这就是"把SRC的脸换到DST上"
+
+【换脸是否真正实现？—— 深度分析】
+
+  ✓ 身份注入路径：AdaINModule接收identity_embed，通过identity_proj→modulation→gamma/beta
+    控制解码器每层的归一化参数，实现身份控制。这是StyleGAN2的成熟机制。
+
+  ✓ 表情/姿态路径：编码器提取的encoder_features通过skip_convs注入解码器，
+    W+风格向量通过style_proj→modulation控制风格。两者共同保留DST的表情姿态。
+
+  ✓ 交叉换脸训练：swap_recon = decode(dst_w+, src_id, dst_enc_feat)
+    损失 = 0.5*L1(swap, src_img) + 0.5*L1(swap, dst_recon)
+    前者确保换脸结果像SRC身份，后者确保保留DST姿态。
+
+  ⚠ 潜在问题1：skip_convs的skip_strength参数在训练中未使用！
+    代码中skip_strength=0.5被收集但从未传入decoder，decoder中skip是直接相加(x=x+skip)，
+    没有乘以skip_strength系数。这意味着skip连接强度不可调。
+
+  ⚠ 潜在问题2：eye/mouth/nose/jaw_priority四个参数在训练中完全未使用！
+    这些参数被收集和保存，但训练循环中没有基于关键点的区域加权损失。
+    DFL中这些参数控制眼睛/嘴巴等区域的损失权重，TFM中尚未实现。
+
+  ⚠ 潜在问题3：face_style_power和bg_style_power在训练中完全未使用！
+    DFL中这些参数控制脸部和背景区域的风格迁移强度，TFM中尚未实现。
+
+  ⚠ 潜在问题4：random_warp参数在训练中未使用！
+    数据增强中只有翻转/旋转/HSV/模糊，没有DFL风格的随机仿射变形。
+
+  ⚠ 潜在问题5：color_transfer参数在训练中未使用！
+    "rct"和"mkl"颜色迁移算法未实现。
+
+  ⚠ 潜在问题6：uniform_yaw_sampling参数在训练中未使用！
+    基于偏航角的均匀采样未实现。
+
+  ⚠ 潜在问题7：GAN判别器只对SRC训练，没有对DST和swap结果训练。
+    DFL中判别器同时区分SRC和DST的真假，当前实现只区分SRC。
+
+  ✓ 已正确实现：resolution, batch_size, learning_rate, use_amp, gan_power,
+    random_hsv_power, lr_schedule, gradient_clip, random_flip, model_preset,
+    window_size, gradient_checkpoint, use_compile, perceptual_weight,
+    identity_weight, save_interval_min, preview_interval_sec
+
+
+二、参数详细说明
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+【基础训练】分组 (14个参数)
+────────────────────────────────────────────────────────────────────────────────
+
+1. resolution (分辨率)
+   类型: int    范围: 64~256    步长: 16    默认: 128
+   说明: 训练和输出人脸图像的分辨率(像素)。必须是16的倍数。
+         128=快速训练/低显存，192=平衡，256=高质量/高显存。
+   注意: 实际应为128的倍数(128/256)，当前允许64~256但非128倍数时效果差。
+   状态: ✓ 已实现
+
+2. face_type (人脸类型)
+   类型: str    选项: half/mid_full/full/whole_face/head    默认: whole_face
+   说明: 决定提取人脸时的裁剪范围。
+         half=半脸, mid_full=中全脸, full=全脸, whole_face=整脸(wf), head=头部
+         whole_face和head是换脸常用选项，head包含更多头发区域。
+   注意: 此参数影响Step2人脸提取，训练时仅作为配置记录。
+   状态: ✓ 已实现(但训练中未直接使用，仅影响数据集)
+
+3. batch_size (批次大小)
+   类型: int    范围: 1~64    默认: 4
+   说明: 每次迭代处理的图像数量。越大训练越稳定但显存占用越高。
+         建议: 6GB显存→2, 8GB→4, 12GB→4~8, 24GB→8~16
+   状态: ✓ 已实现
+
+4. learning_rate (学习率)
+   类型: float    范围: 1e-6~1e-2    步长: 1e-5    默认: 1e-4
+   说明: Adam优化器的初始学习率。控制参数更新步长。
+         1e-4是常用起点，训练后期可配合cosine_annealing自动衰减。
+   状态: ✓ 已实现
+
+5. use_amp (混合精度)
+   类型: bool    默认: True
+   说明: 启用PyTorch自动混合精度(AMP)，用float16前向+float32反向。
+         显存减半、速度提升30-50%，几乎无精度损失。强烈建议开启。
+   状态: ✓ 已实现
+
+6. random_warp (随机变形)
+   类型: bool    默认: True
+   说明: DFL中的随机仿射变形增强，增加训练数据的多样性。
+   状态: ✗ 未实现！参数存在但训练中未使用。当前数据增强只有翻转/旋转/HSV/模糊。
+
+7. gan_power (GAN强度)
+   类型: float    范围: 0.0~5.0    步长: 0.1    默认: 0.0
+   说明: 控制对抗损失的权重。0=不使用GAN，>0启用PatchGAN判别器。
+         GAN改善生成细节(皮肤纹理/毛发)，但训练不稳定。
+         建议初期0.0，训练稳定后逐步增加到0.1~1.0。
+   状态: ⚠ 部分实现。判别器只对SRC训练，未对DST和swap训练。
+
+8. random_hsv_power (HSV增强)
+   类型: float    范围: 0.0~0.3    步长: 0.01    默认: 0.0
+   说明: 控制HSV颜色空间增强的强度。增强模型对颜色变化的鲁棒性。
+         0=不增强，0.1=轻微，0.3=强烈。
+   注意: 当前实现中此参数未传入数据集！TFMDataset的HSV增强是固定概率30%，
+         不受此参数控制。
+   状态: ⚠ 参数存在但未传入数据集控制增强强度。
+
+9. lr_schedule (学习率调度)
+   类型: str    选项: constant/cosine_annealing    默认: constant
+   说明: constant=学习率不变，cosine_annealing=余弦退火，从初始lr衰减到1e-7。
+         余弦退火在训练后期自动降低学习率，有助于收敛到更好的最优解。
+         T_max=200000(20万迭代完成一个周期)。
+   状态: ✓ 已实现
+
+10. save_interval_min (保存间隔)
+    类型: int    范围: 1~120    默认: 15
+    说明: 自动保存模型的时间间隔(分钟)。防止训练中断丢失进度。
+    状态: ✓ 已实现
+
+11. preview_interval_sec (预览间隔)
+    类型: int    范围: 10~600    默认: 60
+    说明: 自动刷新预览的时间间隔(秒)。
+    状态: ✓ 已实现
+
+12. gradient_clip (梯度裁剪)
+    类型: float    范围: 0.0~10.0    步长: 0.1    默认: 1.0
+    说明: 梯度L2范数的最大值。0=不裁剪。防止梯度爆炸导致训练崩溃。
+          1.0是常用值，GAN训练时可能需要更小的值(0.5)。
+    状态: ✓ 已实现
+
+13. random_flip (随机翻转)
+    类型: bool    默认: True
+    说明: 50%概率水平翻转图像。数据增强，增加训练多样性。
+          换脸任务中翻转是安全的(人脸左右对称)。
+    状态: ✓ 已实现
+
+14. color_transfer (颜色迁移)
+    类型: str    选项: none/rct/mkl    默认: none
+    说明: 颜色迁移方法，将DST的颜色风格迁移到SRC，改善换脸后的颜色匹配。
+          none=不迁移，rct=Reinhard颜色迁移，mkl=MKL颜色迁移。
+    状态: ✗ 未实现！参数存在但训练中未使用。
+
+
+────────────────────────────────────────────────────────────────────────────────
+【模型架构】分组 (9个参数)
+────────────────────────────────────────────────────────────────────────────────
+
+15. model_preset (模型预设)
+    类型: str    选项: tiny/small/medium/large    默认: medium
+    说明: 预设配置，自动设置下面5个架构参数。不可单独调整(灰色)。
+          tiny:  embed_dim=24,  depths=[1,1,1,1], heads=[2,4,4,8],   base_ch=128, w_dim=256 → ~5M参数, 4GB显存
+          small: embed_dim=48,  depths=[1,1,2,1], heads=[2,4,8,16],  base_ch=256, w_dim=256 → ~20M参数, 6GB显存
+          medium:embed_dim=96,  depths=[2,2,6,2], heads=[3,6,12,24], base_ch=512, w_dim=512 → ~80M参数, 10GB显存
+          large: embed_dim=128, depths=[2,2,6,2], heads=[4,8,16,32], base_ch=512, w_dim=512 → ~120M参数, 16GB显存
+    状态: ✓ 已实现
+
+16. window_size (窗口大小)
+    类型: str    选项: 4/8/16    默认: 8
+    说明: Swin Transformer的窗口注意力大小。窗口内计算自注意力。
+          4=小窗口/局部注意力/更快，8=平衡，16=大窗口/更多全局信息/更慢。
+          必须能整除resolution/stage_resolution。
+    状态: ✓ 已实现
+
+17. skip_strength (Skip连接强度)
+    类型: float    范围: 0.0~1.0    步长: 0.1    默认: 0.5
+    说明: 编码器特征注入解码器的强度。0=不注入(纯身份驱动)，1=完全注入。
+          控制DST表情/姿态信息传递到解码器的程度。
+    状态: ✗ 未实现！参数存在但解码器中skip直接相加(x=x+skip)，未乘以此系数。
+
+18. gradient_checkpoint (梯度检查点)
+    类型: bool    默认: False
+    说明: 用计算换显存。True=训练时不保存中间激活，反向传播时重新计算。
+          节省30-50%显存，但增加20-30%训练时间。大模型/小显存时建议开启。
+    状态: ✓ 已实现
+
+19. use_compile (torch.compile)
+    类型: bool    默认: False
+    说明: 启用PyTorch 2.0的torch.compile()算子融合优化。
+          mode="reduce-overhead"，可提升10-30%训练速度。
+          首次编译需要几分钟预热时间。需要PyTorch 2.0+和CUDA。
+    状态: ✓ 已实现
+
+20. embed_dim (嵌入维度) [预设控制]
+    类型: int    范围: 16~256    默认: 96
+    说明: Swin Transformer第一阶段的通道数。后续阶段自动翻倍。
+          越大模型容量越大，但计算量和显存也越大。由model_preset自动设置。
+    状态: ✓ 已实现(由预设控制，不可手动调整)
+
+21. depths (块数) [预设控制]
+    类型: str    默认: "[2,2,6,2]"
+    说明: 4个Swin Transformer阶段的SwinBlock数量。
+          第3阶段通常最多(6)，因为该分辨率的特征最丰富。
+          格式: "[stage1, stage2, stage3, stage4]"
+    状态: ✓ 已实现(由预设控制)
+
+22. num_heads (头数) [预设控制]
+    类型: str    默认: "[3,6,12,24]"
+    说明: 4个阶段的多头注意力头数。必须满足embed_dim*2^(i-1)能被num_heads[i]整除。
+          头数越多，注意力越细粒度，但计算量越大。
+    状态: ✓ 已实现(由预设控制)
+
+23. base_channels (基础通道) [预设控制]
+    类型: int    范围: 32~1024    默认: 512
+    说明: 解码器(StyleGAN2)的起始通道数。控制解码器容量。
+          越大解码器生成能力越强，但显存占用越高。
+    状态: ✓ 已实现(由预设控制)
+
+24. w_dim (W+维度) [预设控制]
+    类型: int    范围: 64~1024    默认: 512
+    说明: W+风格空间的维度。W+是StyleGAN2的扩展风格空间，每层有独立的风格向量。
+          维度越大，风格表达能力越强。必须与base_channels协调。
+    状态: ✓ 已实现(由预设控制)
+
+
+────────────────────────────────────────────────────────────────────────────────
+【人脸细节】分组 (6个参数)
+────────────────────────────────────────────────────────────────────────────────
+
+25. eye_priority (眼睛优先)
+    类型: float    范围: 0.5~5.0    步长: 0.1    默认: 1.0
+    说明: 眼睛区域的损失权重。>1.0时眼睛区域的重建误差被放大，
+          训练更关注眼睛细节(瞳孔/眼睑/虹膜)。换脸中眼睛是最重要的识别特征。
+    状态: ✗ 未实现！参数存在但训练中未使用。需要基于关键点的区域加权损失。
+
+26. mouth_priority (嘴巴优先)
+    类型: float    范围: 0.5~5.0    步长: 0.1    默认: 1.0
+    说明: 嘴巴区域的损失权重。>1.0时嘴巴区域的重建误差被放大。
+          改善嘴唇/牙齿的重建质量。
+    状态: ✗ 未实现！参数存在但训练中未使用。
+
+27. nose_priority (鼻子优先)
+    类型: float    范围: 0.5~3.0    步长: 0.1    默认: 1.0
+    说明: 鼻子区域的损失权重。>1.0时鼻子区域的重建误差被放大。
+          改善鼻梁/鼻翼的重建质量。通常不需要太高(鼻子变化较小)。
+    状态: ✗ 未实现！参数存在但训练中未使用。
+
+28. jaw_priority (下颌优先)
+    类型: float    范围: 0.5~3.0    步长: 0.1    默认: 1.0
+    说明: 下颌/下巴区域的损失权重。>1.0时下颌区域的重建误差被放大。
+          改善下巴轮廓的重建质量。
+    状态: ✗ 未实现！参数存在但训练中未使用。
+
+29. face_style_power (脸部风格)
+    类型: float    范围: 0.0~1.0    步长: 0.01    默认: 0.0
+    说明: 控制DST脸部区域风格迁移到换脸结果的强度。
+          0=纯SRC风格，1=完全DST风格。改善换脸后与DST的光照/肤色匹配。
+    状态: ✗ 未实现！参数存在但训练中未使用。
+
+30. bg_style_power (背景风格)
+    类型: float    范围: 0.0~1.0    步长: 0.01    默认: 0.0
+    说明: 控制DST背景区域风格迁移的强度。
+          0=不迁移背景风格，1=完全迁移。改善换脸后背景的一致性。
+    状态: ✗ 未实现！参数存在但训练中未使用。
+
+
+────────────────────────────────────────────────────────────────────────────────
+【损失函数与数据采样】分组 (3个参数)
+────────────────────────────────────────────────────────────────────────────────
+
+31. perceptual_weight (感知损失)
+    类型: float    范围: 0.0~1.0    步长: 0.01    默认: 0.1
+    说明: VGG19感知损失(LPIPS)的权重。感知损失比较VGG19高层特征而非像素。
+          比L1更符合人眼感知，改善纹理/结构质量。0=不使用，0.1=常用值。
+          需要VGG19权重文件(vgg19-dcbb9e9d.pth)。
+    状态: ✓ 已实现
+
+32. identity_weight (身份保持)
+    类型: float    范围: 0.0~1.0    步长: 0.01    默认: 0.05
+    说明: ArcFace身份一致性损失的权重。确保换脸结果的身份嵌入与SRC一致。
+          用InsightFace提取swap结果的embedding，与SRC的embedding计算余弦相似度。
+          0=不使用，0.05=轻微约束，0.1~0.2=强约束。
+          这是换脸质量的关键损失，防止身份漂移。
+    状态: ✓ 已实现(但逐样本CPU推理较慢，已优化为用预计算src_id)
+
+33. uniform_yaw_sampling (均匀角度采样)
+    类型: bool    默认: False
+    说明: 按偏航角(yaw)均匀采样训练数据。默认随机采样可能导致
+          正脸样本过多、侧脸样本不足。开启后各角度等概率采样，
+          改善侧脸换脸质量。
+    状态: ✗ 未实现！参数存在但训练中未使用。
+
+
+三、预设配置详情
+================================================================================
+
+预设名     embed_dim  depths         num_heads       base_ch  w_dim  ≈参数量  ≈显存
+─────────────────────────────────────────────────────────────────────────────────
+tiny       24         [1,1,1,1]      [2,4,4,8]       128      256    ~5M      4GB
+small      48         [1,1,2,1]      [2,4,8,16]      256      256    ~20M     6GB
+medium     96         [2,2,6,2]      [3,6,12,24]     512      512    ~80M     10GB
+large      128        [2,2,6,2]      [4,8,16,32]     512      512    ~120M    16GB
+
+
+四、未实现参数汇总及优先级
+================================================================================
+
+优先级  参数                    说明                          建议实现方式
+─────────────────────────────────────────────────────────────────────────────────
+P0      skip_strength           skip连接强度未生效            decoder中 x = x + skip * skip_strength
+P0      eye/mouth/nose/jaw      区域加权损失未生效            基于kps_106生成权重图，乘以L1损失
+P1      random_warp             随机仿射变形未实现            在TFMDataset._augment_pair中添加
+P1      color_transfer          颜色迁移未实现                实现RCT/MKL算法，在数据加载时应用
+P1      random_hsv_power        HSV增强强度未传入             将参数传入TFMDataset控制增强幅度
+P2      uniform_yaw_sampling    均匀角度采样未实现            基于yaw值构建WeightedRandomSampler
+P2      face_style_power        脸部风格迁移未实现            需要遮罩+风格混合机制
+P2      bg_style_power          背景风格迁移未实现            需要遮罩+风格混合机制
+P2      GAN对DST训练            判别器只对SRC训练             添加DST真假判别+swap真假判别
+
+
+五、模型架构详解
+================================================================================
+
+【编码器】Swin Transformer (tfm_model.py TFMEncoder)
+
+  输入: (B, 3, H, W) RGB图像
+  → PatchEmbed: Conv2d(3, embed_dim, 4, 4) + GroupNorm → (B, C, H/4, W/4)
+  → Stage 1: depths[0]个SwinBlock(dim=embed_dim) → features["stage1"]
+  → PatchMerging: 2x下采样 → (B, 2C, H/8, W/8)
+  → Stage 2: depths[1]个SwinBlock(dim=2*embed_dim) → features["stage2"]
+  → PatchMerging: 2x下采样 → (B, 4C, H/16, W/16)
+  → Stage 3: depths[2]个SwinBlock(dim=4*embed_dim) → features["stage3"]
+  → PatchMerging: 2x下采样 → (B, 8C, H/32, W/32)
+  → Stage 4: depths[3]个SwinBlock(dim=8*embed_dim) → features["stage4"]
+  输出: {stage1~stage4} 多尺度特征字典
+
+  SwinBlock核心: 窗口注意力 + 移位窗口(交替) + 相对位置偏置 + MLP
+  窗口大小: window_size×window_size，跨窗口通过移位(shift)实现信息交换
+
+【W+映射器】WPlusMapper (tfm_model.py)
+
+  输入: stage4特征 (B, last_dim, H/32, W/32)
+  → AdaptiveAvgPool2d(1) → (B, last_dim)
+  → FC(last_dim, 512) → ReLU → FC(512, num_layers*w_dim)
+  → reshape → (B, num_layers, w_dim)
+  输出: W+风格向量，每层一个独立的w_dim维风格
+
+【解码器】StyleGAN2风格 (tfm_model.py TFMDecoder)
+
+  输入: W+风格 + 身份嵌入 + 编码器多尺度特征
+  → ConstInput: 可学习常数 (1, base_ch, 4, 4)
+  → 逐层上采样(×2):
+    → Upsample(2x) + Conv2d(3×3) + AdaIN(identity, w_style) + Noise + LeakyReLU
+    → Skip连接: skip_convs将编码器特征投影后相加
+    → ToRGB: Conv2d(1×1)生成RGB，逐层累加(粗到细)
+  输出: (B, 3, resolution, resolution) RGB图像
+
+  AdaIN核心: 
+    id_feat = identity_proj(identity_embed)     # 身份特征
+    style_feat = style_proj(w_style)            # 风格特征
+    combined = cat([id_feat, style_feat])        # 拼接
+    gamma, beta = modulation(combined)           # 调制参数
+    x_norm = InstanceNorm(x)                    # 实例归一化
+    output = gamma * x_norm + beta              # 身份+风格调制
+
+【判别器】PatchGAN (tfm_model.py TFMDiscriminator)
+
+  输入: (B, 3, H, W) 图像
+  → 4层Conv2d(4×4, stride=2) + InstanceNorm + LeakyReLU
+  → Conv2d(4×4) → (B, 1, 1, 1) 真假判断
+  输出: 标量logits
+
+【身份嵌入】ArcFace (insightface预计算)
+
+  在Step2人脸提取时，InsightFace的detect_faces返回512维embedding。
+  保存到JSON元数据的arcface_embedding字段。
+  训练时直接从identity_cache读取，无需重新推理。
+
+
+六、训练损失详解
+================================================================================
+
+总损失 = L_src + L_dst + 0.5*L_swap_src + 0.5*L_swap_dst
+       + perceptual_weight * (L_perc_src + L_perc_dst + L_perc_swap)
+       + identity_weight * L_identity
+       + gan_power * L_gan
+
+各项说明:
+  L_src       = L1(encode_decode(src_img, src_id), src_img)        SRC自重建
+  L_dst       = L1(encode_decode(dst_img, dst_id), dst_img)        DST自重建
+  L_swap_src  = L1(decode(dst_w+, src_id, dst_feat), src_img)     交叉换脸→像SRC
+  L_swap_dst  = L1(decode(dst_w+, src_id, dst_feat), dst_recon)   交叉换脸→保留DST姿态
+  L_perc_*    = VGG19感知损失(5层特征L1之和)
+  L_identity  = 1 - cos_sim(ArcFace(swap_result), src_id)         身份一致性
+  L_gan       = BCE(D(src_recon), 1)                               生成器对抗损失
+
+
+七、推荐训练配置
+================================================================================
+
+快速测试(tiny, 4GB显存):
+  model_preset=tiny, resolution=128, batch_size=2, use_amp=True,
+  perceptual_weight=0.1, identity_weight=0.05, gan_power=0.0
+
+标准训练(medium, 10GB显存):
+  model_preset=medium, resolution=128, batch_size=4, use_amp=True,
+  perceptual_weight=0.1, identity_weight=0.05, gan_power=0.0,
+  lr_schedule=cosine_annealing, gradient_checkpoint=False
+
+高质量(medium, 12GB+显存):
+  model_preset=medium, resolution=192, batch_size=2, use_amp=True,
+  perceptual_weight=0.1, identity_weight=0.1, gan_power=0.5,
+  lr_schedule=cosine_annealing, gradient_checkpoint=True
+
+最高质量(large, 16GB+显存):
+  model_preset=large, resolution=256, batch_size=1, use_amp=True,
+  perceptual_weight=0.1, identity_weight=0.1, gan_power=1.0,
+  lr_schedule=cosine_annealing, gradient_checkpoint=True, use_compile=True
