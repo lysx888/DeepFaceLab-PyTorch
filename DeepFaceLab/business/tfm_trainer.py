@@ -2,6 +2,7 @@ import colorsys
 import io
 import itertools
 import json
+import math
 import random
 import sys
 import threading
@@ -31,6 +32,65 @@ _logger = get_logger("tfm_trainer")
 _MODEL_PREFIX = "TFM"
 _SAVE_INTERVAL_SEC = 1200
 _PREVIEW_INTERVAL_SEC = 60
+
+
+def _pretrain_id_encoder(
+    id_encoder,
+    src_cache: dict,
+    dst_cache: dict,
+    src_dir: Path,
+    dst_dir: Path,
+    resolution: int,
+    device: torch.device,
+    use_amp: bool,
+    on_log: Optional[Callable],
+) -> None:
+    all_items = []
+    for name, emb in src_cache.items():
+        p = src_dir / name
+        if p.exists():
+            all_items.append((p, emb))
+    for name, emb in dst_cache.items():
+        p = dst_dir / name
+        if p.exists():
+            all_items.append((p, emb))
+    if not all_items:
+        return
+    optimizer = torch.optim.Adam(id_encoder.parameters(), lr=1e-3)
+    id_encoder.train()
+    for epoch in range(10):
+        total_loss = 0.0
+        count = 0
+        random.shuffle(all_items)
+        for i in range(0, len(all_items), 16):
+            batch = all_items[i:i+16]
+            imgs = []
+            targets = []
+            for p, emb in batch:
+                img = cv2.imread(str(p))
+                if img is None:
+                    continue
+                img = cv2.resize(img, (resolution, resolution))
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img_t = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).permute(2, 0, 1) * 2.0 - 1.0
+                imgs.append(img_t)
+                targets.append(torch.from_numpy(emb.astype(np.float32)))
+            if not imgs:
+                continue
+            img_batch = torch.stack(imgs).to(device)
+            target_batch = torch.stack(targets).to(device)
+            target_batch = F.normalize(target_batch, dim=1)
+            with torch.amp.autocast(device.type, enabled=(use_amp and device.type == "cuda")):
+                pred = id_encoder(img_batch)
+                loss = (1.0 - (pred * target_batch).sum(dim=1)).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * len(imgs)
+            count += len(imgs)
+        if on_log is not None:
+            on_log(f"  ID pretrain epoch {epoch+1}/10 loss={total_loss/count:.4f}", True)
+    id_encoder.eval()
 
 _LANDMARK_EYE_R = [35, 41, 40, 42, 39, 37, 33, 36]
 _LANDMARK_EYE_L = [93, 96, 94, 95, 89, 90, 87, 91]
@@ -76,6 +136,69 @@ def _build_region_weight_map(
     _add_region(_LANDMARK_NOSE, nose_priority)
     _add_region(_LANDMARK_JAW, jaw_priority)
     return wmap
+
+
+def _style_loss(pred: torch.Tensor, target: torch.Tensor, weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """DFL-style channel statistics matching loss.
+    
+    Matches per-channel mean and variance between pred and target.
+    Unlike L1/VGG, this works even when poses differ because it only
+    matches statistical properties, not spatial alignment.
+    This is how DFL SAEHD trains swap quality without direct swap loss.
+    """
+    pred_mean = pred.mean(dim=[2, 3])
+    target_mean = target.mean(dim=[2, 3])
+    mean_loss = ((pred_mean - target_mean) ** 2).mean()
+    
+    pred_std = pred.std(dim=[2, 3])
+    target_std = target.std(dim=[2, 3])
+    std_loss = ((pred_std - target_std) ** 2).mean()
+    
+    result = mean_loss + std_loss
+    if not torch.isfinite(result):
+        return torch.zeros(1, device=pred.device, dtype=pred.dtype, requires_grad=True)
+    return result
+
+
+def _dssim_loss(pred: torch.Tensor, target: torch.Tensor, weight_map: Optional[torch.Tensor] = None, filter_size: int = 11) -> torch.Tensor:
+    """Differentiable DSSIM loss (1 - SSIM).
+    
+    DSSIM focuses on structural similarity rather than pixel-level matching.
+    DFL uses DSSIM as its primary reconstruction loss.
+    """
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    
+    padding = filter_size // 2
+    kernel = torch.ones(1, 1, filter_size, filter_size, device=pred.device, dtype=pred.dtype) / (filter_size * filter_size)
+    
+    channels = pred.shape[1]
+    kernel = kernel.expand(channels, 1, -1, -1)
+    
+    mu_pred = F.conv2d(pred, kernel, padding=padding, groups=channels)
+    mu_target = F.conv2d(target, kernel, padding=padding, groups=channels)
+    
+    mu_pred_sq = mu_pred ** 2
+    mu_target_sq = mu_target ** 2
+    mu_pred_target = mu_pred * mu_target
+    
+    sigma_pred_sq = F.conv2d(pred ** 2, kernel, padding=padding, groups=channels) - mu_pred_sq
+    sigma_target_sq = F.conv2d(target ** 2, kernel, padding=padding, groups=channels) - mu_target_sq
+    sigma_pred_target = F.conv2d(pred * target, kernel, padding=padding, groups=channels) - mu_pred_target
+    
+    # Clamp negative variances (numerical instability from conv)
+    sigma_pred_sq = torch.clamp(sigma_pred_sq, min=0.0)
+    sigma_target_sq = torch.clamp(sigma_target_sq, min=0.0)
+    
+    denom = (mu_pred_sq + mu_target_sq + C1) * (sigma_pred_sq + sigma_target_sq + C2)
+    ssim_map = ((2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)) / denom
+    
+    if weight_map is not None:
+        wm_mean = weight_map.mean()
+        if wm_mean > 1e-8:
+            ssim_map = ssim_map * weight_map
+            return 1.0 - ssim_map.mean() / wm_mean
+    return 1.0 - ssim_map.mean()
 
 
 def _weighted_l1_loss(pred: torch.Tensor, target: torch.Tensor, weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -200,7 +323,7 @@ class TFMTrainer:
         mouth_priority: float = 1.0,
         nose_priority: float = 1.0,
         jaw_priority: float = 1.0,
-        face_style_power: float = 2.0,
+        face_style_power: float = 1.0,
         bg_style_power: float = 1.0,
         perceptual_weight: float = 0.0,
         uniform_yaw_sampling: bool = False,
@@ -337,6 +460,7 @@ class TFMTrainer:
             gan_power=gan_power,
             window_size=window_size,
             gradient_checkpoint=gradient_checkpoint,
+            skip_strength=skip_strength,
         ).to(device)
 
         if use_compile and device.type == "cuda" and hasattr(torch, "compile"):
@@ -398,11 +522,40 @@ class TFMTrainer:
             from DeepFaceLab.models.tfm_model import VGGPerceptualLoss
             perceptual_loss_fn = VGGPerceptualLoss().to(device).eval()
 
+        from DeepFaceLab.models.tfm_model import IdentityEncoder
+        id_encoder = IdentityEncoder(embed_dim=512).to(device)
+
+        id_pretrain_path = model_dir / "TFM_identity_encoder.pt"
+        if id_pretrain_path.exists():
+            try:
+                state = torch.load(str(id_pretrain_path), map_location=device, weights_only=True)
+                id_encoder.load_state_dict(state)
+                if on_log is not None:
+                    on_log("IdentityEncoder loaded from saved weights", False)
+            except Exception:
+                pass
+        else:
+            if on_log is not None:
+                on_log("Pre-training IdentityEncoder to align with InsightFace...", False)
+            _pretrain_id_encoder(id_encoder, src_id_cache, dst_id_cache, src_dir, dst_dir, resolution, device, use_amp, on_log)
+            model_dir.mkdir(parents=True, exist_ok=True)
+            id_enc_buf = io.BytesIO()
+            torch.save(id_encoder.state_dict(), id_enc_buf)
+            FileManager.atomic_write(id_pretrain_path, id_enc_buf.getvalue())
+            if on_log is not None:
+                on_log("IdentityEncoder pre-training complete", False)
+
+        for p in id_encoder.parameters():
+            p.requires_grad = False
+        id_encoder.eval()
+        if on_log is not None:
+            on_log("IdentityEncoder frozen (provides stable identity metric)", False)
+
         lock_path = model_dir / ".training_lock"
         model_dir.mkdir(parents=True, exist_ok=True)
         lock_path.write_text(str(time.time()))
 
-        start_iter = self._load_checkpoint(model, optimizer, disc_optimizer, model_dir)
+        start_iter = self._load_checkpoint(model, optimizer, disc_optimizer, model_dir, id_encoder)
 
         total_params = sum(p.numel() for p in model.parameters())
         device_info = ""
@@ -504,8 +657,8 @@ class TFMTrainer:
             src_weight = torch.ones_like(src_mask)
             dst_weight = torch.ones_like(dst_mask)
             if enable_mask:
-                src_weight = src_mask
-                dst_weight = dst_mask
+                src_weight = torch.max(src_mask, torch.full_like(src_mask, 0.1))
+                dst_weight = torch.max(dst_mask, torch.full_like(dst_mask, 0.1))
             need_region_weight = (eye_priority > 1.0 or mouth_priority > 1.0 or nose_priority > 1.0 or jaw_priority > 1.0)
             if need_region_weight:
                 src_wmap_np = np.stack([
@@ -522,42 +675,84 @@ class TFMTrainer:
             with torch.amp.autocast(device.type, enabled=(use_amp and device.type == "cuda")):
                 cur_skip = skip_strength
                 if skip_strength > 0:
-                    ramp_start = 5000
-                    ramp_length = 10000
+                    ramp_start = 500
+                    ramp_length = 1500
                     if iter_count < ramp_start:
                         cur_skip = 0.0
                     elif iter_count < ramp_start + ramp_length:
                         cur_skip = skip_strength * (iter_count - ramp_start) / ramp_length
                     model.decoder.skip_strength = cur_skip
 
+                # --- DFL-style training: autoencoder reconstruction is primary ---
+                # Swap quality is ensured by architecture (information bottleneck),
+                # NOT by direct swap loss. This is the key DFL insight.
+                
                 src_enc_feat, src_w_plus = model.encode(src_img)
                 src_recon = model.decode(src_w_plus, src_id, src_enc_feat)
-                loss_src = _weighted_l1_loss(src_recon, src_img, src_weight)
-
+                
                 dst_enc_feat, dst_w_plus = model.encode(dst_img)
                 dst_recon = model.decode(dst_w_plus, dst_id, dst_enc_feat)
-                loss_dst = _weighted_l1_loss(dst_recon, dst_img, dst_weight)
 
+                # Primary loss: self-reconstruction with DSSIM + L1 (DFL style)
+                # DSSIM focuses on structure, L1 on pixel accuracy
+                loss_src_dssim = _dssim_loss(src_recon, src_img, src_weight)
+                loss_src_l1 = _weighted_l1_loss(src_recon, src_img, src_weight)
+                loss_src = 10.0 * loss_src_dssim + 10.0 * loss_src_l1
+                
+                loss_dst_dssim = _dssim_loss(dst_recon, dst_img, dst_weight)
+                loss_dst_l1 = _weighted_l1_loss(dst_recon, dst_img, dst_weight)
+                loss_dst = 10.0 * loss_dst_dssim + 10.0 * loss_dst_l1
+
+                # Swap: decode with SRC identity + DST structure
                 swap_recon = model.decode(dst_w_plus, src_id, dst_enc_feat)
-                loss_swap_bg = bg_style_power * _weighted_l1_loss(swap_recon, dst_img, 1.0 - dst_weight)
-                if perceptual_loss_fn is not None:
-                    loss_swap_face = perceptual_loss_fn(swap_recon, src_img)
-                else:
-                    loss_swap_face = _weighted_l1_loss(swap_recon, src_img, dst_weight)
-                loss_swap = face_style_power * loss_swap_face + loss_swap_bg
+                
+                # Swap loss: DFL-style indirect supervision
+                # 1. face_style_power: channel statistics matching (works across poses)
+                #    This replaces direct L1/VGG which fails when poses differ
+                swap_face_weight = dst_weight if enable_mask else torch.ones_like(dst_weight)
+                loss_swap_face_style = _style_loss(
+                    swap_recon * swap_face_weight, 
+                    src_img * swap_face_weight
+                )
+                
+                # 2. bg_style_power: swap background should match DST background
+                swap_bg_weight = (1.0 - dst_weight) if enable_mask else torch.ones_like(dst_weight)
+                loss_swap_bg_dssim = _dssim_loss(swap_recon, dst_img, swap_bg_weight)
+                loss_swap_bg_l1 = _weighted_l1_loss(swap_recon, dst_img, swap_bg_weight)
+                
+                # 3. identity consistency: swap should have SRC identity
+                swap_id_emb = id_encoder(swap_recon)
+                src_id_emb = id_encoder(src_img)
+                loss_swap_id = (1.0 - (swap_id_emb * src_id_emb).sum(dim=1)).mean()
+                
+                # Combine swap losses (DFL: swap is indirect, weights are moderate)
+                loss_swap = face_style_power * loss_swap_face_style + \
+                            bg_style_power * (loss_swap_bg_dssim + loss_swap_bg_l1) + \
+                            0.5 * loss_swap_id
 
                 loss = loss_src + loss_dst + loss_swap
 
+                # Reverse swap every 5 iters (DST identity on SRC structure)
                 if iter_count % 5 == 0:
                     swap_rev = model.decode(src_w_plus, dst_id, src_enc_feat)
-                    loss_swap_rev_bg = bg_style_power * _weighted_l1_loss(swap_rev, src_img, 1.0 - src_weight)
-                    if perceptual_loss_fn is not None:
-                        loss_swap_rev_face = perceptual_loss_fn(swap_rev, dst_img)
-                    else:
-                        loss_swap_rev_face = _weighted_l1_loss(swap_rev, dst_img, src_weight)
-                    loss_swap_rev = face_style_power * loss_swap_rev_face + loss_swap_rev_bg
+                    swap_rev_face_weight = src_weight if enable_mask else torch.ones_like(src_weight)
+                    loss_swap_rev_face_style = _style_loss(
+                        swap_rev * swap_rev_face_weight,
+                        dst_img * swap_rev_face_weight
+                    )
+                    swap_rev_bg_weight = (1.0 - src_weight) if enable_mask else torch.ones_like(src_weight)
+                    loss_swap_rev_bg_dssim = _dssim_loss(swap_rev, src_img, swap_rev_bg_weight)
+                    loss_swap_rev_bg_l1 = _weighted_l1_loss(swap_rev, src_img, swap_rev_bg_weight)
+                    swap_rev_id_emb = id_encoder(swap_rev)
+                    dst_id_emb = id_encoder(dst_img)
+                    loss_swap_rev_id = (1.0 - (swap_rev_id_emb * dst_id_emb).sum(dim=1)).mean()
+                    loss_swap_rev = face_style_power * loss_swap_rev_face_style + \
+                                    bg_style_power * (loss_swap_rev_bg_dssim + loss_swap_rev_bg_l1) + \
+                                    0.5 * loss_swap_rev_id
                     loss = loss + loss_swap_rev
 
+                # W+ orthogonality: w_plus should NOT encode identity
+                # Stronger weight (1.0 instead of 0.1) to force separation
                 src_w_flat = src_w_plus.mean(dim=1)
                 dst_w_flat = dst_w_plus.mean(dim=1)
                 src_id_norm = F.normalize(src_id, dim=1)
@@ -566,21 +761,23 @@ class TFMTrainer:
                 dst_w_norm = F.normalize(dst_w_flat, dim=1)
                 ortho_loss = (src_w_norm * src_id_norm).sum(dim=1).pow(2).mean() + \
                              (dst_w_norm * dst_id_norm).sum(dim=1).pow(2).mean()
-                loss = loss + 0.1 * ortho_loss
+                loss = loss + 1.0 * ortho_loss
 
+                # Self-reconstruction perceptual loss (optional, helps detail)
                 if perceptual_weight > 0 and perceptual_loss_fn is not None:
                     loss = loss + perceptual_weight * perceptual_loss_fn(src_recon, src_img)
                     loss = loss + perceptual_weight * perceptual_loss_fn(dst_recon, dst_img)
 
                 if gan_power > 0 and model.discriminator is not None:
+                    # GAN only on self-reconstruction (DFL style)
                     disc_real_src = model.discriminate(src_img)
                     disc_fake_src = model.discriminate(src_recon.detach())
                     disc_real_dst = model.discriminate(dst_img)
-                    disc_fake_swap = model.discriminate(swap_recon.detach())
+                    disc_fake_dst = model.discriminate(dst_recon.detach())
                     disc_loss = nn.functional.binary_cross_entropy_with_logits(disc_real_src, torch.ones_like(disc_real_src)) + \
                                 nn.functional.binary_cross_entropy_with_logits(disc_fake_src, torch.zeros_like(disc_fake_src)) + \
                                 nn.functional.binary_cross_entropy_with_logits(disc_real_dst, torch.ones_like(disc_real_dst)) + \
-                                nn.functional.binary_cross_entropy_with_logits(disc_fake_swap, torch.zeros_like(disc_fake_swap))
+                                nn.functional.binary_cross_entropy_with_logits(disc_fake_dst, torch.zeros_like(disc_fake_dst))
 
                     if disc_optimizer is not None:
                         disc_optimizer.zero_grad()
@@ -590,7 +787,7 @@ class TFMTrainer:
                     gen_gan_loss = nn.functional.binary_cross_entropy_with_logits(
                         model.discriminate(src_recon), torch.ones_like(disc_real_src)
                     ) + nn.functional.binary_cross_entropy_with_logits(
-                        model.discriminate(swap_recon), torch.ones_like(disc_real_src)
+                        model.discriminate(dst_recon), torch.ones_like(disc_real_dst)
                     )
                     loss = loss + gan_power * gen_gan_loss
 
@@ -609,6 +806,9 @@ class TFMTrainer:
             self._iter_count = iter_count
             iter_ms = (time.time() - t0) * 1000
             loss_val = loss.item()
+            if not math.isfinite(loss_val):
+                _logger.warning(f"NaN/Inf loss at iter #{iter_count}, skipping")
+                continue
             self._loss_history.append((iter_count, loss_val))
 
             if on_iter is not None:
@@ -619,7 +819,7 @@ class TFMTrainer:
             if self._save_event.is_set():
                 if on_log is not None:
                     on_log("", False)
-                self._save_checkpoint(model, optimizer, disc_optimizer, iter_count, model_dir)
+                self._save_checkpoint(model, optimizer, disc_optimizer, iter_count, model_dir, id_encoder)
                 last_save_time = now
                 self._save_event.clear()
                 self._preview_event.set()
@@ -629,7 +829,7 @@ class TFMTrainer:
             need_preview = (now - last_preview_time) >= preview_interval_sec or self._preview_event.is_set()
             if on_preview is not None and need_preview:
                 try:
-                    preview_img = self._generate_preview(model, device, resolution)
+                    preview_img = self._generate_preview(model, device, resolution, src_id_cache, dst_id_cache)
                     on_preview(preview_img)
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower():
@@ -644,14 +844,17 @@ class TFMTrainer:
             if (now - last_save_time) >= save_interval_min * 60:
                 if on_log is not None:
                     on_log("", False)
-                self._save_checkpoint(model, optimizer, disc_optimizer, iter_count, model_dir)
+                self._save_checkpoint(model, optimizer, disc_optimizer, iter_count, model_dir, id_encoder)
                 last_save_time = now
                 self._preview_event.set()
                 if on_save is not None:
                     on_save(iter_count)
 
-        self._save_checkpoint(model, optimizer, disc_optimizer, iter_count, model_dir)
+        self._save_checkpoint(model, optimizer, disc_optimizer, iter_count, model_dir, id_encoder)
         model.save(model_dir)
+        id_encoder_buf = io.BytesIO()
+        torch.save(id_encoder.state_dict(), id_encoder_buf)
+        FileManager.atomic_write(model_dir / "TFM_identity_encoder.pt", id_encoder_buf.getvalue())
         try:
             lock_path.unlink()
         except OSError:
@@ -665,12 +868,14 @@ class TFMTrainer:
         model: TFMModel,
         device: torch.device,
         resolution: int,
+        src_id_cache: dict[str, np.ndarray],
+        dst_id_cache: dict[str, np.ndarray],
     ) -> np.ndarray:
         model.eval()
         n = self._preview_n
 
-        src_samples = self._sample_images(self._preview_src_paths, n, resolution)
-        dst_samples = self._sample_images(self._preview_dst_paths, n, resolution)
+        src_samples = self._sample_images(self._preview_src_paths, n, resolution, src_id_cache)
+        dst_samples = self._sample_images(self._preview_dst_paths, n, resolution, dst_id_cache)
 
         sections = []
 
@@ -769,13 +974,13 @@ class TFMTrainer:
         row = np.concatenate([I, recon_bgr, diff, blank, blank], axis=1)
         return np.clip(row, 0, 1)
 
-    def _sample_images(self, paths: list[Path], n: int, resolution: int) -> list[tuple[np.ndarray, torch.Tensor, torch.Tensor]]:
+    def _sample_images(self, paths: list[Path], n: int, resolution: int, identity_cache: Optional[dict[str, np.ndarray]] = None) -> list[tuple[np.ndarray, torch.Tensor, torch.Tensor]]:
         if not paths:
             return []
         sampled = random.sample(paths, min(n, len(paths)))
         result = []
         for p in sampled:
-            cache_key = f"{p.parent.name}_{p.name}_{resolution}"
+            cache_key = f"{p.parent.parent.name}_{p.parent.name}_{p.name}_{resolution}"
             cached = self._preview_cache.get(cache_key)
             if cached is not None:
                 result.append(cached)
@@ -787,10 +992,16 @@ class TFMTrainer:
             img_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
             img_t = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0) * 2.0 - 1.0
 
-            meta = MetadataManager.load(p)
-            if meta is not None and meta.arcface_embedding is not None:
-                identity = torch.from_numpy(meta.arcface_embedding.astype(np.float32)).unsqueeze(0)
-            else:
+            identity = None
+            if identity_cache is not None:
+                emb = identity_cache.get(p.name)
+                if emb is not None:
+                    identity = torch.from_numpy(emb.astype(np.float32)).unsqueeze(0)
+            if identity is None:
+                meta = MetadataManager.load(p)
+                if meta is not None and meta.arcface_embedding is not None:
+                    identity = torch.from_numpy(meta.arcface_embedding.astype(np.float32)).unsqueeze(0)
+            if identity is None:
                 identity = torch.zeros(1, 512, dtype=torch.float32)
 
             entry = (resized, img_t, identity)
@@ -880,7 +1091,7 @@ class TFMTrainer:
         result_bgr = result_bgr[:, :, ::-1].copy()
         return result_bgr
 
-    def _save_checkpoint(self, model: TFMModel, optimizer: torch.optim.Optimizer, disc_optimizer, iteration: int, model_dir: Path):
+    def _save_checkpoint(self, model: TFMModel, optimizer: torch.optim.Optimizer, disc_optimizer, iteration: int, model_dir: Path, id_encoder=None):
         model_dir = Path(model_dir)
         model_dir.mkdir(parents=True, exist_ok=True)
         ckpt = {
@@ -890,11 +1101,13 @@ class TFMTrainer:
         }
         if disc_optimizer is not None:
             ckpt["disc_optimizer_state_dict"] = disc_optimizer.state_dict()
+        if id_encoder is not None:
+            ckpt["id_encoder_state_dict"] = id_encoder.state_dict()
         buf = io.BytesIO()
         torch.save(ckpt, buf)
         FileManager.atomic_write(model_dir / f"{_MODEL_PREFIX}_ckpt.pt", buf.getvalue())
 
-    def _load_checkpoint(self, model: TFMModel, optimizer: torch.optim.Optimizer, disc_optimizer, model_dir: Path) -> int:
+    def _load_checkpoint(self, model: TFMModel, optimizer: torch.optim.Optimizer, disc_optimizer, model_dir: Path, id_encoder=None) -> int:
         ckpt_path = Path(model_dir) / f"{_MODEL_PREFIX}_ckpt.pt"
         if not ckpt_path.exists():
             return 0
@@ -905,6 +1118,8 @@ class TFMTrainer:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             if disc_optimizer is not None and "disc_optimizer_state_dict" in ckpt:
                 disc_optimizer.load_state_dict(ckpt["disc_optimizer_state_dict"])
+            if id_encoder is not None and "id_encoder_state_dict" in ckpt:
+                id_encoder.load_state_dict(ckpt["id_encoder_state_dict"])
             iteration = ckpt.get("iter", 0)
             _logger.info(f"Resumed TFM training from iter #{iteration}")
             return iteration
