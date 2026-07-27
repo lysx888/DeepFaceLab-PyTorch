@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, RandomSampler
 
@@ -199,8 +200,8 @@ class TFMTrainer:
         mouth_priority: float = 1.0,
         nose_priority: float = 1.0,
         jaw_priority: float = 1.0,
-        face_style_power: float = 0.0,
-        bg_style_power: float = 0.0,
+        face_style_power: float = 2.0,
+        bg_style_power: float = 1.0,
         perceptual_weight: float = 0.0,
         uniform_yaw_sampling: bool = False,
         enable_mask: bool = True,
@@ -281,8 +282,8 @@ class TFMTrainer:
             model_dir.mkdir(parents=True, exist_ok=True)
             TFMDataset.save_identity_cache(dst_id_cache, dst_cache_path)
 
-        src_ds = TFMDataset(src_dir, resolution=resolution, is_src=True, identity_cache=src_id_cache, augment=True, random_hsv_power=random_hsv_power, random_warp=random_warp, color_transfer=color_transfer)
-        dst_ds = TFMDataset(dst_dir, resolution=resolution, is_src=False, identity_cache=dst_id_cache, augment=True, random_hsv_power=random_hsv_power, random_warp=random_warp, color_transfer=color_transfer)
+        src_ds = TFMDataset(src_dir, resolution=resolution, is_src=True, identity_cache=src_id_cache, augment=True, random_hsv_power=random_hsv_power, random_warp=random_warp, random_flip=random_flip, color_transfer=color_transfer)
+        dst_ds = TFMDataset(dst_dir, resolution=resolution, is_src=False, identity_cache=dst_id_cache, augment=True, random_hsv_power=random_hsv_power, random_warp=random_warp, random_flip=random_flip, color_transfer=color_transfer)
 
         dl_cfg = get_dataloader_config("gpu_train" if device.type == "cuda" else "cpu_train", dataset_size=len(src_ds) + len(dst_ds))
 
@@ -519,6 +520,16 @@ class TFMTrainer:
                 dst_weight = dst_weight * torch.from_numpy(dst_wmap_np).unsqueeze(1).to(device)
 
             with torch.amp.autocast(device.type, enabled=(use_amp and device.type == "cuda")):
+                cur_skip = skip_strength
+                if skip_strength > 0:
+                    ramp_start = 5000
+                    ramp_length = 10000
+                    if iter_count < ramp_start:
+                        cur_skip = 0.0
+                    elif iter_count < ramp_start + ramp_length:
+                        cur_skip = skip_strength * (iter_count - ramp_start) / ramp_length
+                    model.decoder.skip_strength = cur_skip
+
                 src_enc_feat, src_w_plus = model.encode(src_img)
                 src_recon = model.decode(src_w_plus, src_id, src_enc_feat)
                 loss_src = _weighted_l1_loss(src_recon, src_img, src_weight)
@@ -528,29 +539,38 @@ class TFMTrainer:
                 loss_dst = _weighted_l1_loss(dst_recon, dst_img, dst_weight)
 
                 swap_recon = model.decode(dst_w_plus, src_id, dst_enc_feat)
-                loss_swap = _weighted_l1_loss(swap_recon, src_img, src_weight) + \
-                            _weighted_l1_loss(swap_recon, dst_recon.detach(), dst_weight)
+                loss_swap_bg = bg_style_power * _weighted_l1_loss(swap_recon, dst_img, 1.0 - dst_weight)
+                if perceptual_loss_fn is not None:
+                    loss_swap_face = perceptual_loss_fn(swap_recon, src_img)
+                else:
+                    loss_swap_face = _weighted_l1_loss(swap_recon, src_img, dst_weight)
+                loss_swap = face_style_power * loss_swap_face + loss_swap_bg
 
                 loss = loss_src + loss_dst + loss_swap
 
                 if iter_count % 5 == 0:
                     swap_rev = model.decode(src_w_plus, dst_id, src_enc_feat)
-                    loss_swap_rev = _weighted_l1_loss(swap_rev, dst_img, dst_weight) + \
-                                    _weighted_l1_loss(swap_rev, src_recon.detach(), src_weight)
+                    loss_swap_rev_bg = bg_style_power * _weighted_l1_loss(swap_rev, src_img, 1.0 - src_weight)
+                    if perceptual_loss_fn is not None:
+                        loss_swap_rev_face = perceptual_loss_fn(swap_rev, dst_img)
+                    else:
+                        loss_swap_rev_face = _weighted_l1_loss(swap_rev, dst_img, src_weight)
+                    loss_swap_rev = face_style_power * loss_swap_rev_face + loss_swap_rev_bg
                     loss = loss + loss_swap_rev
 
-                if face_style_power > 0 and enable_mask:
-                    swap_face = swap_recon * dst_weight + dst_img * (1.0 - dst_weight)
-                    loss = loss + face_style_power * _weighted_l1_loss(swap_recon, swap_face.detach(), dst_weight)
-
-                if bg_style_power > 0 and enable_mask:
-                    swap_bg = swap_recon * (1.0 - dst_weight) + dst_img * dst_weight
-                    loss = loss + bg_style_power * _weighted_l1_loss(swap_recon, swap_bg.detach(), 1.0 - dst_weight)
+                src_w_flat = src_w_plus.mean(dim=1)
+                dst_w_flat = dst_w_plus.mean(dim=1)
+                src_id_norm = F.normalize(src_id, dim=1)
+                dst_id_norm = F.normalize(dst_id, dim=1)
+                src_w_norm = F.normalize(src_w_flat, dim=1)
+                dst_w_norm = F.normalize(dst_w_flat, dim=1)
+                ortho_loss = (src_w_norm * src_id_norm).sum(dim=1).pow(2).mean() + \
+                             (dst_w_norm * dst_id_norm).sum(dim=1).pow(2).mean()
+                loss = loss + 0.1 * ortho_loss
 
                 if perceptual_weight > 0 and perceptual_loss_fn is not None:
                     loss = loss + perceptual_weight * perceptual_loss_fn(src_recon, src_img)
                     loss = loss + perceptual_weight * perceptual_loss_fn(dst_recon, dst_img)
-                    loss = loss + perceptual_weight * perceptual_loss_fn(swap_recon, src_img)
 
                 if gan_power > 0 and model.discriminator is not None:
                     disc_real_src = model.discriminate(src_img)
@@ -569,6 +589,8 @@ class TFMTrainer:
 
                     gen_gan_loss = nn.functional.binary_cross_entropy_with_logits(
                         model.discriminate(src_recon), torch.ones_like(disc_real_src)
+                    ) + nn.functional.binary_cross_entropy_with_logits(
+                        model.discriminate(swap_recon), torch.ones_like(disc_real_src)
                     )
                     loss = loss + gan_power * gen_gan_loss
 
