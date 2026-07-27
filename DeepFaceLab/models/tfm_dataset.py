@@ -197,7 +197,7 @@ class TFMDataset(Dataset):
             hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
             hsv[:, :, 0] += np.random.uniform(-10, 10)
             hsv[:, :, 1] *= np.random.uniform(0.8, 1.2)
-            hsv = np.clip(hsv, 0, 179).astype(np.uint8)
+            hsv = np.clip(hsv, [0, 0, 0], [179, 255, 255]).astype(np.uint8)
             img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
         if np.random.random() < 0.2:
