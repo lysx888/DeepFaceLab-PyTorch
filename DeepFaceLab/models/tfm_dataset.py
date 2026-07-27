@@ -24,6 +24,7 @@ class TFMDataset(Dataset):
         preload: bool = True,
         random_hsv_power: float = 0.0,
         random_warp: bool = True,
+        random_flip: bool = True,
         color_transfer: str = "none",
     ) -> None:
         self._aligned_dir = Path(aligned_dir)
@@ -33,6 +34,7 @@ class TFMDataset(Dataset):
         self._augment = augment
         self._random_hsv_power = random_hsv_power
         self._random_warp = random_warp
+        self._random_flip = random_flip
         self._color_transfer = color_transfer
         self._image_paths: list[Path] = FileManager.find_images(self._aligned_dir)
         self._metadata_cache: dict[str, FaceMetadata] = MetadataManager.load_all(self._aligned_dir)
@@ -48,22 +50,17 @@ class TFMDataset(Dataset):
         self._mask_cache: dict[str, np.ndarray] = {}
         for p in self._image_paths:
             meta = self._metadata_cache.get(p.name)
-            if meta is not None and meta.seg_ie_polys is not None:
-                img = self._image_cache.get(p.name)
-                if img is None:
-                    img = cv2.imread(str(p))
-                if img is not None:
-                    self._mask_cache[p.name] = self._render_mask_from_polys(img.shape[:2], meta)
-        if self._mask_cache:
-            _logger.info(f"TFMDataset ({'src' if is_src else 'dst'}): pre-rendered {len(self._mask_cache)} masks")
-
-        self._image_cache: dict[str, np.ndarray] = {}
-        if preload and len(self._image_paths) <= 2000:
-            for p in self._image_paths:
+            img = self._image_cache.get(p.name)
+            if img is None:
                 img = cv2.imread(str(p))
-                if img is not None:
-                    self._image_cache[p.name] = img
-            _logger.info(f"TFMDataset ({'src' if is_src else 'dst'}): preloaded {len(self._image_cache)}/{len(self._image_paths)} images into memory")
+            if img is None:
+                continue
+            if meta is not None and meta.seg_ie_polys is not None:
+                self._mask_cache[p.name] = self._render_mask_from_polys(img.shape[:2], meta)
+            elif meta is not None and meta.landmarks_106 is not None:
+                self._mask_cache[p.name] = self._render_face_mask_from_landmarks(img.shape[:2], meta)
+        if self._mask_cache:
+            _logger.info(f"TFMDataset ({'src' if is_src else 'dst'}): pre-rendered {len(self._mask_cache)} masks ({sum(1 for p in self._image_paths if self._metadata_cache.get(p.name) and self._metadata_cache[p.name].seg_ie_polys is not None)} XSeg, {sum(1 for p in self._image_paths if self._metadata_cache.get(p.name) and self._metadata_cache[p.name].seg_ie_polys is None and self._metadata_cache[p.name].landmarks_106 is not None)} landmark)")
 
         if not self._image_paths:
             raise ValueError(f"No face images found in {self._aligned_dir}")
@@ -149,8 +146,24 @@ class TFMDataset(Dataset):
                 cv2.fillPoly(mask, [pts], 0)
         return mask
 
+    @staticmethod
+    def _render_face_mask_from_landmarks(shape: tuple, meta: FaceMetadata) -> np.ndarray:
+        h, w = shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        if meta.landmarks_106 is None:
+            return np.ones((h, w), dtype=np.uint8) * 255
+        lm = meta.landmarks_106.astype(np.float64)
+        scale_x = w / meta.output_size if meta.output_size != w else 1.0
+        scale_y = h / meta.output_size if meta.output_size != h else 1.0
+        lm[:, 0] *= scale_x
+        lm[:, 1] *= scale_y
+        hull = cv2.convexHull(lm.astype(np.float32))
+        hull = hull.astype(np.int64)
+        cv2.fillPoly(mask, [hull], 255)
+        return mask
+
     def _augment_pair(self, img: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        if np.random.random() < 0.5:
+        if self._random_flip and np.random.random() < 0.5:
             img = np.fliplr(img).copy()
             mask = np.fliplr(mask).copy()
 
