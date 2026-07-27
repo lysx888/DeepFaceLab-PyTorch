@@ -349,6 +349,8 @@ class TFMDecoder(nn.Module):
         if encoder_dims is None:
             encoder_dims = [96, 192, 384, 768]
 
+        self.num_enc_stages = len(encoder_dims)
+
         self.const_input = ConstInput(base_channels, size=4)
         self.bottleneck_proj = nn.Conv2d(encoder_dims[-1], base_channels, 1)
 
@@ -375,8 +377,8 @@ class TFMDecoder(nn.Module):
             )
             self.to_rgb_layers.append(ToRGB(out_ch))
 
-            enc_idx = self.num_layers - 2 - i
-            if 0 <= enc_idx < len(encoder_dims):
+            enc_idx = self.num_enc_stages - 2 - i
+            if 0 <= enc_idx < self.num_enc_stages:
                 self.skip_convs.append(nn.Conv2d(encoder_dims[enc_idx], in_ch, 1))
             else:
                 self.skip_convs.append(None)
@@ -389,7 +391,7 @@ class TFMDecoder(nn.Module):
     ) -> torch.Tensor:
         B = w_plus.shape[0]
         if encoder_features is not None:
-            bottleneck_key = f"stage{len(self.skip_convs) + 1}" if len(self.skip_convs) > 0 else "stage4"
+            bottleneck_key = f"stage{self.num_enc_stages}"
             if bottleneck_key in encoder_features:
                 x = self.bottleneck_proj(encoder_features[bottleneck_key])
             else:
@@ -405,7 +407,7 @@ class TFMDecoder(nn.Module):
 
             skip = None
             if encoder_features is not None and i < len(self.skip_convs) and self.skip_convs[i] is not None:
-                enc_idx = self.num_layers - 2 - i
+                enc_idx = self.num_enc_stages - 2 - i
                 enc_key = f"stage{enc_idx + 1}"
                 if enc_key in encoder_features:
                     enc_feat = encoder_features[enc_key]
