@@ -291,12 +291,6 @@ class ResBlock(nn.Module):
 
 
 class SynthesisLayer(nn.Module):
-    """Decoder layer: upsample → conv → style_mod → noise → activate.
-
-    DFL df-style: NO SPADE, NO skip connections.
-    Identity is in decoder WEIGHTS, not in any input signal.
-    The only input is the Inter code (structure/pose, identity-free).
-    """
 
     def __init__(
         self,
@@ -342,18 +336,6 @@ class ToRGB(nn.Module):
 
 
 class TFMDecoder(nn.Module):
-    """DFL-style CNN spatial decoder.
-
-    Input: spatial feature map from Inter bottleneck (ae_dims @ res/16).
-    Identity is in DECODER WEIGHTS — each decoder (src/dst) only sees
-    one identity during training, so its weights encode that identity.
-
-    Architecture: project → Upscale → 3×(Upscale + ResBlock) → Conv1x1 → Tanh
-    Channel progression (ae_dims=256, d_dims=64, res=128):
-      Input: 256@8×8 → proj→512@8×8 → Upscale→512@16×16 → Res
-      → Upscale→256@32 → Res → Upscale→128@64 → Res
-      → Upscale→64@128 → Res → Conv1x1→3@128 → Tanh
-    """
 
     def __init__(
         self,
@@ -487,21 +469,6 @@ class VGGPerceptualLoss(nn.Module):
 
 
 class TFMInter(nn.Module):
-    """Information bottleneck between encoder and decoder (DFL-style).
-
-    DFL's critical design: Dense(32768→256) compresses encoder output 128:1,
-    forcing identity out of the latent code. Identity can only be encoded
-    in decoder weights.
-
-    Our version:
-    1. Flatten encoder's deepest stage features
-    2. Dense compress to ae_dims (bottleneck!)
-    3. Dense expand to spatial feature map (bottleneck_res² × ae_dims)
-    4. Upscale 2x → output spatial feature map for CNN decoder
-
-    The compression ratio is the key: too small → lose structure info,
-    too large → identity leaks through. DFL uses 128:1 for 128px.
-    """
 
     def __init__(
         self,
@@ -532,22 +499,6 @@ class TFMInter(nn.Module):
 
 
 class TFMModel(nn.Module):
-    """TFM face swap model with Swin Transformer encoder + DFL CNN decoder.
-
-    Architecture:
-    - Shared encoder (Swin Transformer) extracts multi-scale features
-    - Inter bottleneck: Dense compress → ae_dims → Dense expand → spatial map → Upscale 2x
-      This FORCES identity out of the latent code (DFL's key insight)
-    - decoder_src / decoder_dst: DFL CNN decoder (Upscale + ResBlock)
-      Identity is in DECODER WEIGHTS, not in any embedding
-    - Swap: encoder(dst) → Inter → decoder_src → SRC face on DST structure
-
-    Why this works:
-    - Inter bottleneck compresses 128:1 → identity cannot survive in code
-    - CNN decoder takes spatial feature map → identity naturally encoded in conv weights
-    - decoder_src only trained on SRC → its weights encode SRC identity
-    - decoder_src(dst_code) = SRC appearance + DST structure = face swap
-    """
 
     def __init__(
         self,
