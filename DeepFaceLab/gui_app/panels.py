@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
 )
 
 from DeepFaceLab.gui_app.gui_log import gui_log, gui_error
-from DeepFaceLab.gui_app.tfm_param_defs import ParamGroup
+from DeepFaceLab.gui_app.param_defs import ParamGroup
 from DeepFaceLab.setting import (
     WORKSPACE_DIR, MODEL_DIR,
     DATA_SRC_DIR, DATA_DST_DIR,
@@ -1303,38 +1303,106 @@ class Step3XSeg(StepPanel):
 
 class Step4Train(StepPanel):
     step_title = "4. 训练模型"
-    step_desc = "训练TFM换脸模型。"
+    step_desc = "选择模型类型进行训练。"
     show_run_buttons = False
 
-    def _build_params(self):
-        from DeepFaceLab.gui_app.tfm_param_defs import (
-            ParamGroupWidget, PresetManager, ConfigManager,
-            TrainingSignals, TrainingStatusBar, PreviewThumbnailBar,
-            AdvancedModelSection, get_params_by_group,
-        )
+    MODE_SAEHD = "SAEHD"
+    MODE_TFM = "TFM"
 
-        self._param_groups: dict[ParamGroup, ParamGroupWidget] = {}
+    def _build_params(self):
+        from DeepFaceLab.gui_app.param_defs import (
+            ParamGroupWidget, ConfigManager,
+            TrainingSignals, TrainingStatusBar,
+        )
+        from DeepFaceLab.gui_app.tfm_param_defs import (
+            get_tfm_params_by_group, TFMPresetManager,
+        )
+        from DeepFaceLab.gui_app.saehd_param_defs import (
+            get_saehd_params_by_group,
+        )
+        from PyQt6.QtWidgets import QStackedWidget
+
+        # ---- Mode toggle buttons (SAEHD | TFM) ----
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(8)
+        self._mode_btn_saehd = QPushButton("SAEHD")
+        self._mode_btn_tfm = QPushButton("TFM")
+        for btn in (self._mode_btn_saehd, self._mode_btn_tfm):
+            btn.setFixedHeight(36)
+            btn.setCheckable(True)
+            btn.setStyleSheet(
+                "QPushButton { font-size: 14px; font-weight: 700; border-radius: 4px; padding: 0 20px; }"
+                "QPushButton:checked { background-color: #0078D4; color: white; }"
+                "QPushButton:not(:checked) { background-color: #E0E0E0; color: #333; }"
+            )
+        self._mode_btn_saehd.setChecked(True)
+        self._mode_btn_tfm.setChecked(False)
+        mode_row.addWidget(self._mode_btn_saehd)
+        mode_row.addWidget(self._mode_btn_tfm)
+        mode_row.addStretch(1)
+        self.layout().addLayout(mode_row)
+
+        self._mode_btn_saehd.clicked.connect(lambda: self._switch_mode(self.MODE_SAEHD))
+        self._mode_btn_tfm.clicked.connect(lambda: self._switch_mode(self.MODE_TFM))
+        self._current_mode = self.MODE_SAEHD
+
+        # ---- Stacked area for SAEHD / TFM params ----
+        self._stack = QStackedWidget()
+        self.layout().addWidget(self._stack)
+
+        # -- Page 0: SAEHD params (grouped style, same as TFM) --
+        saehd_page = QWidget()
+        saehd_layout = QVBoxLayout(saehd_page)
+        saehd_layout.setContentsMargins(0, 4, 0, 0)
+        saehd_layout.setSpacing(6)
+
+        self._saehd_param_groups: dict[ParamGroup, ParamGroupWidget] = {}
+        for group in [ParamGroup.BASIC, ParamGroup.ARCHITECTURE, ParamGroup.FACE_DETAIL]:
+            pw = ParamGroupWidget(group, get_saehd_params_by_group(group))
+            self._saehd_param_groups[group] = pw
+            saehd_layout.addWidget(pw)
+            spacer = QWidget()
+            spacer.setFixedHeight(12)
+            saehd_layout.addWidget(spacer)
+
+        self._saehd_config_manager = ConfigManager(MODEL_DIR, "SAEHD_training_config.json")
+        saved_saehd = self._saehd_config_manager.load_config()
+        if saved_saehd:
+            for pw in self._saehd_param_groups.values():
+                pw.set_values(saved_saehd)
+
+        self._stack.addWidget(saehd_page)  # index 0
+
+        # -- Page 1: TFM params (grouped style) --
+        tfm_page = QWidget()
+        tfm_layout = QVBoxLayout(tfm_page)
+        tfm_layout.setContentsMargins(0, 4, 0, 0)
+        tfm_layout.setSpacing(6)
+
+        self._tfm_param_groups: dict[ParamGroup, ParamGroupWidget] = {}
         for group in [ParamGroup.BASIC, ParamGroup.ARCHITECTURE, ParamGroup.FACE_DETAIL, ParamGroup.LOSS_SAMPLING]:
-            pw = ParamGroupWidget(group)
-            self._param_groups[group] = pw
-            self.layout().addWidget(pw)
+            pw = ParamGroupWidget(group, get_tfm_params_by_group(group))
+            self._tfm_param_groups[group] = pw
+            tfm_layout.addWidget(pw)
             if group != ParamGroup.LOSS_SAMPLING:
                 spacer = QWidget()
-                spacer.setFixedHeight(20)
-                self.layout().addWidget(spacer)
+                spacer.setFixedHeight(12)
+                tfm_layout.addWidget(spacer)
 
-        preset_combo = self._param_groups[ParamGroup.ARCHITECTURE].get_widget("model_preset")
-        self._preset_manager = PresetManager(self._param_groups[ParamGroup.ARCHITECTURE], preset_combo)
+        preset_combo = self._tfm_param_groups[ParamGroup.ARCHITECTURE].get_widget("model_preset")
+        self._preset_manager = TFMPresetManager(self._tfm_param_groups[ParamGroup.ARCHITECTURE], preset_combo)
 
-        self._config_manager = ConfigManager(MODEL_DIR)
-        saved = self._config_manager.load_config()
-        if saved:
-            for group, pw in self._param_groups.items():
-                pw.set_values(saved)
-            self._preset_manager.apply_saved_preset(saved)
-
+        self._tfm_config_manager = ConfigManager(MODEL_DIR, "TFM_training_config.json")
+        saved_tfm = self._tfm_config_manager.load_config()
+        if saved_tfm:
+            for pw in self._tfm_param_groups.values():
+                pw.set_values(saved_tfm)
+            self._preset_manager.apply_saved_preset(saved_tfm)
         self._preset_manager.on_preset_changed(self._preset_manager.get_current_preset())
 
+        self._stack.addWidget(tfm_page)  # index 1
+
+        # ---- Shared: Run / Stop buttons ----
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         self._run_btn = QPushButton("开始")
@@ -1349,9 +1417,11 @@ class Step4Train(StepPanel):
         btn_row.addWidget(self._stop_btn)
         self.layout().addLayout(btn_row)
 
+        # ---- Shared: Status bar ----
         self._status_bar = TrainingStatusBar()
         self.layout().addWidget(self._status_bar)
 
+        # ---- Shared: Log text ----
         self._log_text = QTextEdit()
         self._log_text.setReadOnly(True)
         self._log_text.setMinimumHeight(100)
@@ -1359,6 +1429,7 @@ class Step4Train(StepPanel):
         self._log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 11px; background-color: #1e1e1e; color: #d4d4d4;")
         self.layout().addWidget(self._log_text)
 
+        # ---- Shared: Signals ----
         self._signals = TrainingSignals()
         self._signals.iter_signal.connect(self._on_iter_status)
         self._signals.save_signal.connect(self._on_save_notify)
@@ -1376,9 +1447,22 @@ class Step4Train(StepPanel):
         self._log_throttle_time = 0.0
         self._log_throttle_interval = 0.5
 
+    def _switch_mode(self, mode: str):
+        self._current_mode = mode
+        self._mode_btn_saehd.setChecked(mode == self.MODE_SAEHD)
+        self._mode_btn_tfm.setChecked(mode == self.MODE_TFM)
+        self._stack.setCurrentIndex(0 if mode == self.MODE_SAEHD else 1)
+
+    def _collect_saehd_params(self) -> dict:
+        params = {}
+        for pw in self._saehd_param_groups.values():
+            params.update(pw.get_values())
+        params.pop("face_type", None)
+        return params
+
     def _collect_tfm_params(self) -> dict:
         params = {}
-        for pw in self._param_groups.values():
+        for pw in self._tfm_param_groups.values():
             params.update(pw.get_values())
         if "depths" in params and isinstance(params["depths"], str):
             try:
@@ -1396,13 +1480,21 @@ class Step4Train(StepPanel):
             params.pop(key, None)
         return params
 
+    # ---- Run / Stop ----
+
     def _on_run(self):
-        from DeepFaceLab.business.tfm_trainer import TFMTrainer
+        if self._current_mode == self.MODE_SAEHD:
+            self._run_saehd()
+        else:
+            self._run_tfm()
+
+    def _run_saehd(self):
+        from DeepFaceLab.business.saehd_trainer import SAEHDTrainer
         import threading
         import time as _time
 
-        params = self._collect_tfm_params()
-        self._config_manager.save_config(params)
+        params = self._collect_saehd_params()
+        self._saehd_config_manager.save_config(params)
 
         self._set_controls_enabled(False)
         self._status_bar.start_pulse()
@@ -1410,6 +1502,76 @@ class Step4Train(StepPanel):
         self._log_need_newline = True
         self._log_throttle_time = 0.0
 
+        self._log_text.append("== SAEHD Training ==")
+        for k, v in params.items():
+            self._log_text.append(f"  {k}: {v}")
+        self._log_text.append("")
+
+        trainer = SAEHDTrainer()
+        self._trainer = trainer
+        signals = self._signals
+        panel = self
+
+        def _on_iter(iter_count, loss_val, iter_ms):
+            now = _time.time()
+            if now - panel._log_throttle_time < panel._log_throttle_interval:
+                return
+            panel._log_throttle_time = now
+            from datetime import datetime
+            ts = datetime.now().strftime("%H:%M:%S")
+            if iter_ms >= 10000:
+                line = f"[{ts}][#{iter_count}][{iter_ms/1000:.1f}s][{loss_val:.4f}]"
+            else:
+                line = f"[{ts}][#{iter_count}][{int(iter_ms)}ms][{loss_val:.4f}]"
+            overwrite = not panel._log_need_newline
+            panel._log_need_newline = False
+            signals.log_signal.emit(line, overwrite)
+
+        def _on_preview(preview_bgr):
+            panel._preview_signal.preview_ready.emit(preview_bgr)
+
+        def _on_save(iter_count):
+            from datetime import datetime
+            ts = datetime.now().strftime("%H:%M:%S")
+            panel._log_need_newline = True
+            signals.log_signal.emit(f"[{ts}][#{iter_count}] saved", False)
+
+        def _on_log(text, overwrite):
+            signals.log_signal.emit(text, overwrite)
+
+        def _task():
+            try:
+                trainer.train(
+                    DATA_SRC_ALIGNED_DIR, DATA_DST_ALIGNED_DIR, MODEL_DIR,
+                    **params,
+                    on_iter=_on_iter,
+                    on_preview=_on_preview,
+                    on_save=_on_save,
+                    on_log=_on_log,
+                )
+            except Exception as e:
+                signals.error_signal.emit(str(e))
+            finally:
+                signals.finished_signal.emit()
+
+        self._training_thread = threading.Thread(target=_task, daemon=True)
+        self._training_thread.start()
+
+    def _run_tfm(self):
+        from DeepFaceLab.business.tfm_trainer import TFMTrainer
+        import threading
+        import time as _time
+
+        params = self._collect_tfm_params()
+        self._tfm_config_manager.save_config(params)
+
+        self._set_controls_enabled(False)
+        self._status_bar.start_pulse()
+        self._log_text.clear()
+        self._log_need_newline = True
+        self._log_throttle_time = 0.0
+
+        self._log_text.append("== TFM Training ==")
         for k, v in params.items():
             self._log_text.append(f"  {k}: {v}")
         self._log_text.append("")
@@ -1472,9 +1634,13 @@ class Step4Train(StepPanel):
     def _set_controls_enabled(self, enabled: bool):
         self._run_btn.setEnabled(enabled)
         self._stop_btn.setEnabled(not enabled)
-        for pw in self._param_groups.values():
+        self._mode_btn_saehd.setEnabled(enabled)
+        self._mode_btn_tfm.setEnabled(enabled)
+        for pw in self._saehd_param_groups.values():
             pw.set_editable(enabled)
-        preset_combo = self._param_groups[ParamGroup.ARCHITECTURE].get_widget("model_preset")
+        for pw in self._tfm_param_groups.values():
+            pw.set_editable(enabled)
+        preset_combo = self._tfm_param_groups[ParamGroup.ARCHITECTURE].get_widget("model_preset")
         if preset_combo:
             preset_combo.setEnabled(enabled)
 
@@ -1503,7 +1669,8 @@ class Step4Train(StepPanel):
 
         if self._preview_win is None:
             self._preview_win = QDialog(self)
-            self._preview_win.setWindowTitle("TFM 训练预览 | [space]:切换 [p]:刷新 [s]:保存 [l]:历史范围 [Enter]:保存并停止")
+            mode_name = "SAEHD" if self._current_mode == self.MODE_SAEHD else "TFM"
+            self._preview_win.setWindowTitle(f"{mode_name} 训练预览 | [space]:切换 [p]:刷新 [s]:保存 [l]:历史范围 [Enter]:保存并停止")
             self._preview_win.setWindowFlags(self._preview_win.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint)
             lay = QVBoxLayout(self._preview_win)
             lbl = QLabel()
@@ -1530,7 +1697,8 @@ class Step4Train(StepPanel):
         key = event.key()
         if key == Qt.Key.Key_Space:
             if self._trainer is not None:
-                self._trainer._preview_page += 1
+                if hasattr(self._trainer, '_preview_page'):
+                    self._trainer._preview_page += 1
                 self._trainer.request_preview()
         elif key == Qt.Key.Key_P:
             if self._trainer is not None:
