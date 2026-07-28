@@ -153,11 +153,7 @@ def _style_loss(pred: torch.Tensor, target: torch.Tensor, weight_map: Optional[t
 
 
 def _dssim_loss(pred: torch.Tensor, target: torch.Tensor, weight_map: Optional[torch.Tensor] = None, filter_size: int = 11) -> torch.Tensor:
-    """Differentiable DSSIM loss (1 - SSIM).
-    
-    DSSIM focuses on structural similarity rather than pixel-level matching.
-    DFL uses DSSIM as its primary reconstruction loss.
-    """
+
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
     
