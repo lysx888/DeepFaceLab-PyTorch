@@ -1,6 +1,4 @@
 """
-SAEHD Trainer — Exact PyTorch reimplementation of DFL's SAEHD training logic.
-
 Loss functions (from original DFL Model.py):
   - DSSIM + MSE for reconstruction (resolution-dependent weights)
   - Mask MSE loss
