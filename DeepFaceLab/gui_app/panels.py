@@ -1502,11 +1502,6 @@ class Step4Train(StepPanel):
         self._log_need_newline = True
         self._log_throttle_time = 0.0
 
-        self._log_text.append("== SAEHD Training ==")
-        for k, v in params.items():
-            self._log_text.append(f"  {k}: {v}")
-        self._log_text.append("")
-
         trainer = SAEHDTrainer()
         self._trainer = trainer
         signals = self._signals
@@ -1570,11 +1565,6 @@ class Step4Train(StepPanel):
         self._log_text.clear()
         self._log_need_newline = True
         self._log_throttle_time = 0.0
-
-        self._log_text.append("== TFM Training ==")
-        for k, v in params.items():
-            self._log_text.append(f"  {k}: {v}")
-        self._log_text.append("")
 
         trainer = TFMTrainer()
         self._trainer = trainer
