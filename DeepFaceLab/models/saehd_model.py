@@ -1,18 +1,3 @@
-"""
-SAEHD Model — Exact PyTorch reimplementation of DFL's SAEHD architecture.
-
-Supports:
-  - 'df' architecture: shared encoder + shared inter + SEPARATE decoders (src/dst)
-  - 'liae' architecture: shared encoder + inter_AB/inter_B + shared decoder
-  - 'u' option: pixel normalization in encoder
-  - Mask branch: decoder outputs both RGB face and face mask
-
-Key insight: identity is encoded in DECODER WEIGHTS, not in any embedding.
-  - df: decoder_src only sees src faces → always produces src identity
-  - liae: inter_AB learns shared structure, inter_B learns dst identity;
-          swap removes inter_B → decoder can only produce src identity
-"""
-
 import io
 import json
 import math
