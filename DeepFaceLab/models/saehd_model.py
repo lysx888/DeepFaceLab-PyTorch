@@ -1,4 +1,5 @@
 import io
+import itertools
 import json
 import math
 from pathlib import Path
@@ -83,6 +84,122 @@ class ResidualBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# UNetPatchDiscriminator (DFL GAN)
+# ---------------------------------------------------------------------------
+
+def _find_unet_disc_archi(target_patch_size: int, max_layers: int = 10) -> list[int]:
+    """Find optimal stride configuration for UNetPatchDiscriminator.
+    
+    Returns list of strides (1 or 2) per layer that produces a receptive field
+    closest to target_patch_size.
+    """
+    best_strides = [2]
+    best_diff = abs(target_patch_size - 3)
+
+    for n_layers in range(1, max_layers + 1):
+        for strides in itertools.product([1, 2], repeat=n_layers):
+            rf = 1
+            for s in strides:
+                rf = rf * s + (3 - s)
+            diff = abs(target_patch_size - rf)
+            if diff < best_diff:
+                best_diff = diff
+                best_strides = list(strides)
+            if diff == 0:
+                return best_strides
+    return best_strides
+
+
+class UNetPatchDiscriminator(nn.Module):
+    """DFL's UNetPatchDiscriminator: U-Net discriminator with dual output.
+    
+    Inspired by "A U-Net Based Discriminator for Generative Adversarial Networks"
+    (https://arxiv.org/abs/2002.12655)
+    
+    Returns (center_out, unet_out) for multi-scale adversarial loss.
+    """
+
+    def __init__(self, in_ch: int = 3, base_ch: int = 16, patch_size: int = 16):
+        super().__init__()
+        strides = _find_unet_disc_archi(patch_size)
+        n_layers = len(strides)
+
+        level_chs = [min(base_ch * (2 ** i), 512) for i in range(n_layers + 1)]
+
+        self.in_conv = nn.Conv2d(in_ch, level_chs[-1], kernel_size=1)
+        self.encoder_convs = nn.ModuleList()
+        for i in range(n_layers):
+            self.encoder_convs.append(nn.Conv2d(
+                level_chs[n_layers - i], level_chs[n_layers - i - 1],
+                kernel_size=3, stride=strides[i], padding=1,
+            ))
+
+        self.center_conv = nn.Conv2d(level_chs[0], level_chs[0], kernel_size=3, padding=1)
+        self.center_out_conv = nn.Conv2d(level_chs[0], 1, kernel_size=1)
+
+        self.decoder_convs = nn.ModuleList()
+        for i in range(n_layers):
+            ch_in = level_chs[i + 1] * 2  # concat with skip
+            ch_out = level_chs[i + 1]
+            self.decoder_convs.append(nn.ConvTranspose2d(
+                ch_in, ch_out, kernel_size=3, stride=strides[n_layers - 1 - i],
+                padding=1, output_padding=strides[n_layers - 1 - i] - 1,
+            ))
+
+        self.out_conv = nn.Conv2d(level_chs[-1] * 2, 1, kernel_size=1)
+        self.n_layers = n_layers
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = F.leaky_relu(self.in_conv(x), 0.2)
+
+        skips = [x]
+        for conv in self.encoder_convs:
+            x = F.leaky_relu(conv(x), 0.2)
+            skips.append(x)
+
+        center = F.leaky_relu(self.center_conv(x), 0.2)
+        center_out = self.center_out_conv(center)
+
+        for i, conv in enumerate(self.decoder_convs):
+            skip = skips[self.n_layers - i]
+            if x.shape[2:] != skip.shape[2:]:
+                x = F.interpolate(x, size=skip.shape[2:], mode="nearest")
+            x = F.leaky_relu(conv(torch.cat([x, skip], dim=1)), 0.2)
+
+        skip0 = skips[0]
+        if x.shape[2:] != skip0.shape[2:]:
+            x = F.interpolate(x, size=skip0.shape[2:], mode="nearest")
+        out = self.out_conv(torch.cat([x, skip0], dim=1))
+
+        return center_out, out
+
+
+class CodeDiscriminator(nn.Module):
+    """DFL's CodeDiscriminator for true_face_power.
+    
+    Operates on encoder latent code (not pixels) to discriminate src vs dst codes.
+    Only applicable to 'df' architecture.
+    """
+
+    def __init__(self, in_ch: int, code_res: int, base_ch: int = 256):
+        super().__init__()
+        n_downscales = 1 + code_res // 8
+        self.convs = nn.ModuleList()
+        prev_ch = in_ch
+        for i in range(n_downscales):
+            cur_ch = base_ch * min(2 ** i, 8)
+            kernel_size = 4 if i == 0 else 3
+            self.convs.append(nn.Conv2d(prev_ch, cur_ch, kernel_size, stride=2, padding=kernel_size // 2))
+            prev_ch = cur_ch
+        self.out_conv = nn.Conv2d(prev_ch, 1, kernel_size=1, padding=0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for conv in self.convs:
+            x = F.leaky_relu(conv(x), 0.1)
+        return self.out_conv(x)
+
+
+# ---------------------------------------------------------------------------
 # Encoder
 # ---------------------------------------------------------------------------
 
@@ -156,18 +273,17 @@ class SAEHDInter(nn.Module):
 class SAEHDDecoder(nn.Module):
     """
     3 upscale stages with residual blocks + separate mask branch.
-
-    Face branch: Upscale→Res → Upscale→Res → Upscale→Res → Conv1x1→Sigmoid
-    Mask branch: Upscale → Upscale → Upscale → Conv1x1→Sigmoid
-
-    For res=128, d_dims=64:
-      Input: 512ch @ 8x8 (from inter)
-      Face: 512@16→Res→256@32→Res→128@64→Res→ 1x1conv→3@128→Sigmoid
-      Mask: 21@16→21@32→21@64→ 1x1conv→1@128→Sigmoid
+    
+    With use_depth_to_space=True ('d' option):
+      Final output uses 4 parallel convs + depth_to_space for 2x resolution boost
+      instead of a standard Upscale stage. This is more compute-efficient.
     """
 
-    def __init__(self, in_ch: int, d_dims: int = 64, d_mask_dims: int = 21):
+    def __init__(self, in_ch: int, d_dims: int = 64, d_mask_dims: int = 21,
+                 use_depth_to_space: bool = False):
         super().__init__()
+        self.use_depth_to_space = use_depth_to_space
+
         # Face branch
         self.upscale0 = Upscale(in_ch, d_dims * 8)
         self.res0 = ResidualBlock(d_dims * 8)
@@ -175,13 +291,33 @@ class SAEHDDecoder(nn.Module):
         self.res1 = ResidualBlock(d_dims * 4)
         self.upscale2 = Upscale(d_dims * 4, d_dims * 2)
         self.res2 = ResidualBlock(d_dims * 2)
-        self.out_conv = nn.Conv2d(d_dims * 2, 3, kernel_size=1, padding=0)
+
+        if use_depth_to_space:
+            self.out_conv = nn.Conv2d(d_dims * 2, 3, kernel_size=1, padding=0)
+            self.out_conv1 = nn.Conv2d(d_dims * 2, 3, kernel_size=3, padding=1)
+            self.out_conv2 = nn.Conv2d(d_dims * 2, 3, kernel_size=3, padding=1)
+            self.out_conv3 = nn.Conv2d(d_dims * 2, 3, kernel_size=3, padding=1)
+        else:
+            self.out_conv = nn.Conv2d(d_dims * 2, 3, kernel_size=1, padding=0)
 
         # Mask branch
         self.upscalem0 = Upscale(in_ch, d_mask_dims * 8)
         self.upscalem1 = Upscale(d_mask_dims * 8, d_mask_dims * 4)
         self.upscalem2 = Upscale(d_mask_dims * 4, d_mask_dims * 2)
-        self.out_convm = nn.Conv2d(d_mask_dims * 2, 1, kernel_size=1, padding=0)
+        if use_depth_to_space:
+            self.upscalem3 = Upscale(d_mask_dims * 2, d_mask_dims * 1)
+            self.out_convm = nn.Conv2d(d_mask_dims * 1, 1, kernel_size=1, padding=0)
+        else:
+            self.out_convm = nn.Conv2d(d_mask_dims * 2, 1, kernel_size=1, padding=0)
+
+    def _depth_to_space(self, x: torch.Tensor, block_size: int = 2) -> torch.Tensor:
+        """PixelShuffle: rearrange channels into spatial dimensions."""
+        B, C, H, W = x.shape
+        oc = C // (block_size * block_size)
+        x = x.reshape(B, block_size, block_size, oc, H, W)
+        x = x.permute(0, 3, 4, 1, 5, 2)
+        x = x.reshape(B, oc, H * block_size, W * block_size)
+        return x
 
     def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # Face
@@ -191,12 +327,22 @@ class SAEHDDecoder(nn.Module):
         x = self.res1(x)
         x = self.upscale2(x)
         x = self.res2(x)
-        face = torch.sigmoid(self.out_conv(x))
+
+        if self.use_depth_to_space:
+            c0 = self.out_conv(x)
+            c1 = self.out_conv1(x)
+            c2 = self.out_conv2(x)
+            c3 = self.out_conv3(x)
+            face = torch.sigmoid(self._depth_to_space(torch.cat([c0, c1, c2, c3], dim=1), 2))
+        else:
+            face = torch.sigmoid(self.out_conv(x))
 
         # Mask
         m = self.upscalem0(z)
         m = self.upscalem1(m)
         m = self.upscalem2(m)
+        if self.use_depth_to_space:
+            m = self.upscalem3(m)
         mask = torch.sigmoid(self.out_convm(m))
 
         return face, mask
@@ -230,6 +376,8 @@ class SAEHDModel(nn.Module):
         e_dims: int = 64,
         d_dims: int = 64,
         d_mask_dims: int = None,
+        gan_dims: int = 16,
+        gan_patch_size: int = None,
     ):
         super().__init__()
         self.resolution = resolution
@@ -239,6 +387,11 @@ class SAEHDModel(nn.Module):
         self.d_dims = d_dims
         self.d_mask_dims = d_mask_dims if d_mask_dims is not None else (d_dims // 3 + d_dims // 3 % 2)
         self.use_liae = (architecture == "liae")
+        archi_parts = architecture.split("-")
+        self.archi_type = archi_parts[0]  # df or liae
+        self.archi_opts = archi_parts[1] if len(archi_parts) > 1 else ""  # u/d/t/c
+        self.use_depth_to_space = "d" in self.archi_opts
+        self.use_pixel_norm = "u" in self.archi_opts
 
         # Calculate downscale steps: res → res/2 → ... → res/16
         n_downscales = 0
@@ -251,10 +404,14 @@ class SAEHDModel(nn.Module):
         enc_downscales = 4
         bottleneck_res = resolution // (2 ** enc_downscales)  # 8 for res=128
 
+        # 'd' option: bottleneck is half the resolution (extra depth_to_space at output)
+        if self.use_depth_to_space:
+            bottleneck_res = bottleneck_res // 2
+
         # Encoder
         self.encoder = SAEHDEncoder(
             in_ch=3, e_dims=e_dims, n_downscales=enc_downscales,
-            use_pixel_norm=self.use_liae,  # 'u' option equivalent for liae
+            use_pixel_norm=self.use_pixel_norm or self.use_liae,
         )
         enc_out_features = self.encoder.out_ch * (bottleneck_res ** 2)
 
@@ -267,8 +424,10 @@ class SAEHDModel(nn.Module):
                 bottleneck_res=bottleneck_res,
             )
             inter_out_ch = ae_dims
-            self.decoder_src = SAEHDDecoder(inter_out_ch, d_dims, self.d_mask_dims)
-            self.decoder_dst = SAEHDDecoder(inter_out_ch, d_dims, self.d_mask_dims)
+            self.decoder_src = SAEHDDecoder(inter_out_ch, d_dims, self.d_mask_dims,
+                                            use_depth_to_space=self.use_depth_to_space)
+            self.decoder_dst = SAEHDDecoder(inter_out_ch, d_dims, self.d_mask_dims,
+                                            use_depth_to_space=self.use_depth_to_space)
         else:
             # liae architecture: inter_AB + inter_B + shared decoder
             self.inter_AB = SAEHDInter(
@@ -285,13 +444,41 @@ class SAEHDModel(nn.Module):
             )
             # Shared decoder takes concat(inter_X, inter_Y) = 2x channels
             shared_dec_in_ch = ae_dims * 2 * 2  # concat of two inter outputs
-            self.decoder = SAEHDDecoder(shared_dec_in_ch, d_dims, self.d_mask_dims)
+            self.decoder = SAEHDDecoder(shared_dec_in_ch, d_dims, self.d_mask_dims,
+                                        use_depth_to_space=self.use_depth_to_space)
+
+        self.gan_dims = gan_dims
+        self.gan_patch_size = gan_patch_size if gan_patch_size is not None else max(8, resolution // 8)
+        self.discriminator = None
+        self.code_discriminator = None
 
     # ---- Forward methods for training ----
 
     def encode(self, img: torch.Tensor) -> torch.Tensor:
         """Encode image to bottleneck code."""
         return self.encoder(img)
+
+    def build_discriminator(self) -> UNetPatchDiscriminator:
+        """Build the UNetPatchDiscriminator for GAN training."""
+        self.discriminator = UNetPatchDiscriminator(
+            in_ch=3, base_ch=self.gan_dims, patch_size=self.gan_patch_size,
+        )
+        return self.discriminator
+
+    def discriminate(self, img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run discriminator, returns (center_out, unet_out)."""
+        if self.discriminator is None:
+            raise RuntimeError("Discriminator not built. Call build_discriminator() first.")
+        return self.discriminator(img)
+
+    def build_code_discriminator(self, code_res: int) -> CodeDiscriminator:
+        """Build CodeDiscriminator for true_face_power (df architecture only)."""
+        if self.use_liae:
+            raise RuntimeError("CodeDiscriminator only supports df architecture")
+        self.code_discriminator = CodeDiscriminator(
+            in_ch=self.ae_dims, code_res=code_res, base_ch=256,
+        )
+        return self.code_discriminator
 
     def decode_src(self, code: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Decode through src path (df) or src code path (liae)."""
@@ -443,6 +630,16 @@ class SAEHDModel(nn.Module):
             torch.save(module.state_dict(), buf)
             FileManager.atomic_write(model_dir / f"SAEHD_{name}.pt", buf.getvalue())
 
+        if self.discriminator is not None:
+            buf = io.BytesIO()
+            torch.save(self.discriminator.state_dict(), buf)
+            FileManager.atomic_write(model_dir / "SAEHD_discriminator.pt", buf.getvalue())
+
+        if self.code_discriminator is not None:
+            buf = io.BytesIO()
+            torch.save(self.code_discriminator.state_dict(), buf)
+            FileManager.atomic_write(model_dir / "SAEHD_code_discriminator.pt", buf.getvalue())
+
         _logger.info(f"SAEHD model saved to {model_dir}")
 
     def load(self, model_dir: Path, device: torch.device = None) -> bool:
@@ -469,6 +666,22 @@ class SAEHDModel(nn.Module):
                 data = open(str(path), "rb").read()
                 module.load_state_dict(torch.load(io.BytesIO(data), map_location=map_loc, weights_only=True))
 
+        disc_path = model_dir / "SAEHD_discriminator.pt"
+        if disc_path.exists():
+            if self.discriminator is None:
+                self.build_discriminator()
+            data = open(str(disc_path), "rb").read()
+            self.discriminator.load_state_dict(torch.load(io.BytesIO(data), map_location=map_loc, weights_only=True))
+
+        code_disc_path = model_dir / "SAEHD_code_discriminator.pt"
+        if code_disc_path.exists() and not self.use_liae:
+            code_res = self.inter.get_out_res() if not self.use_liae else 0
+            if code_res > 0:
+                if self.code_discriminator is None:
+                    self.build_code_discriminator(code_res)
+                data = open(str(code_disc_path), "rb").read()
+                self.code_discriminator.load_state_dict(torch.load(io.BytesIO(data), map_location=map_loc, weights_only=True))
+
         _logger.info(f"SAEHD model loaded from {model_dir}")
         return True
 
@@ -481,6 +694,8 @@ class SAEHDModel(nn.Module):
             e_dims=config.get("e_dims", 64),
             d_dims=config.get("d_dims", 64),
             d_mask_dims=config.get("d_mask_dims", None),
+            gan_dims=config.get("gan_dims", 16),
+            gan_patch_size=config.get("gan_patch_size", None),
         )
 
     def get_param_groups(self) -> list:
