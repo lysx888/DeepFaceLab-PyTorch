@@ -192,3 +192,17 @@ class InsightFaceAdapter:
         e1 = face1.embedding / (np.linalg.norm(face1.embedding) + 1e-10)
         e2 = face2.embedding / (np.linalg.norm(face2.embedding) + 1e-10)
         return float(np.dot(e1, e2))
+
+    def get_rec_model(self):
+        self._ensure_app()
+        return self._app.models.get("recognition", None)
+
+    def extract_embedding_aligned(self, aligned_face_bgr: npt.NDArray[np.uint8]) -> Optional[npt.NDArray[np.float32]]:
+        self._ensure_app()
+        rec_model = self._app.models.get("recognition", None)
+        if rec_model is None:
+            return None
+        embedding = rec_model.get_feat(aligned_face_bgr)
+        if embedding is not None:
+            return embedding.astype(np.float32).flatten()
+        return None
