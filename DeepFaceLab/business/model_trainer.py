@@ -32,16 +32,25 @@ class ModelType(Enum):
 _SAEHD_PARAMS = [
     {"key": "resolution",       "label": "Resolution",              "type": int,   "default": 128,  "min": 64,  "max": 640,  "help": "Higher resolution = more VRAM. Adjusted to multiple of 16."},
     {"key": "face_type",        "label": "Face type",               "type": str,   "default": "whole_face", "choices": ["half", "mid_full", "full", "whole_face", "head"], "help": "half/mid_full/full/whole_face/head"},
-    {"key": "architecture",     "label": "AE architecture",         "type": str,   "default": "df", "choices": ["df", "liae"], "help": "df = more identity, liae = can fix different face shapes"},
-    {"key": "ae_dims",          "label": "AutoEncoder dimensions",  "type": int,   "default": 256,  "min": 32,  "max": 1024, "help": "More dims = better quality but more VRAM"},
-    {"key": "e_dims",           "label": "Encoder dimensions",      "type": int,   "default": 64,   "min": 16,  "max": 256,  "help": "More dims = sharper result but more VRAM"},
-    {"key": "d_dims",           "label": "Decoder dimensions",      "type": int,   "default": 64,   "min": 16,  "max": 256,  "help": "More dims = sharper result but more VRAM"},
-    {"key": "batch_size",       "label": "Batch size",              "type": int,   "default": 4,    "min": 1,   "max": 64,   "help": "Higher = more VRAM. 4GB VRAM -> 4, 8GB+ -> 8"},
-    {"key": "learning_rate",    "label": "Learning rate",           "type": float, "default": 1e-4, "min": 1e-6, "max": 1e-2, "help": "Typical: 1e-4"},
+    {"key": "architecture",     "label": "AE architecture",         "type": str,   "default": "df", "choices": ["df", "liae", "df-d", "liae-d", "df-ud", "liae-ud", "df-udt", "liae-udt"], "help": "df = more identity, liae = can fix different face shapes"},
+    {"key": "ae_dims",          "label": "AutoEncoder dimensions",  "type": int,   "default": 256, "min": 32,  "max": 1024, "help": "More dims = better quality but more VRAM"},
+    {"key": "e_dims",           "label": "Encoder dimensions",      "type": int,   "default": 64,   "min": 16,  "max": 256, "help": "More dims = sharper result but more VRAM"},
+    {"key": "d_dims",           "label": "Decoder dimensions",      "type": int,   "default": 64,   "min": 16,  "max": 256, "help": "More dims = sharper result but more VRAM"},
+    {"key": "batch_size",       "label": "Batch size",              "type": int,   "default": 8,    "min": 1,   "max": 64,   "help": "Higher = more VRAM. 4GB VRAM -> 4, 8GB+ -> 8"},
+    {"key": "learning_rate",    "label": "Learning rate",           "type": float, "default": 5e-5, "min": 1e-6, "max": 1e-2, "help": "Typical: 5e-5 (DFL default)"},
     {"key": "use_amp",          "label": "Use AMP (mixed precision)", "type": bool, "default": True, "help": "Faster training, less VRAM"},
-    {"key": "random_warp",      "label": "Enable random warp",      "type": bool,  "default": True,  "help": "Required for generalization. Disable for extra sharpness late in training"},
-    {"key": "gan_power",        "label": "GAN power",               "type": float, "default": 0.0,  "min": 0.0, "max": 5.0,  "help": "0=off. Typical fine value 0.1. Enable only when face is trained enough"},
-    {"key": "random_hsv_power", "label": "Random hue/sat/light",    "type": float, "default": 0.0,  "min": 0.0, "max": 0.3,  "help": "Stabilizes color. Typical: 0.05"},
+    {"key": "random_warp",      "label": "Enable random warp",      "type": bool,  "default": True, "help": "Required for generalization. Disable for extra sharpness late in training"},
+    {"key": "random_flip",      "label": "Random flip",             "type": bool,  "default": True, "help": "Random horizontal flip"},
+    {"key": "random_hsv_power", "label": "Random hue/sat/light",    "type": float, "default": 0.0, "min": 0.0, "max": 0.3,  "help": "Stabilizes color. Typical: 0.05"},
+    {"key": "color_transfer",   "label": "Color transfer",          "type": str,   "default": "none", "choices": ["none", "rct", "mkl"], "help": "Color transfer mode"},
+    {"key": "face_style_power", "label": "Face style power",        "type": float, "default": 0.0, "min": 0.0, "max": 100.0,"help": "Learn face color from dst. Enable after 10k iters. Typical: 0.001"},
+    {"key": "bg_style_power",   "label": "BG style power",          "type": float, "default": 0.0, "min": 0.0, "max": 100.0,"help": "Learn bg color from dst. Typical: 2.0"},
+    {"key": "eyes_mouth_prio",  "label": "Eyes and mouth priority", "type": bool,  "default": False,"help": "Helps fix eye problems and teeth detail"},
+    {"key": "masked_training",  "label": "Masked training",         "type": bool,  "default": True, "help": "Clip training area to face mask"},
+    {"key": "gan_power",        "label": "GAN power",               "type": float, "default": 0.0, "min": 0.0, "max": 5.0,  "help": "0=off. Typical fine value 0.1. Enable only when face is trained enough"},
+    {"key": "gradient_clip",    "label": "Gradient clipping",       "type": bool,  "default": False,"help": "Reduces chance of model collapse"},
+    {"key": "save_interval_min", "label": "Save interval (min)",    "type": float, "default": 15.0, "min": 1.0, "max": 120.0, "help": "Auto-save interval in minutes"},
+    {"key": "preview_interval_sec", "label": "Preview interval (sec)", "type": float, "default": 60.0, "min": 10.0, "max": 600.0, "help": "Preview update interval in seconds"},
 ]
 
 _QUICK96_PARAMS = [
@@ -73,16 +82,15 @@ _TFM_PARAMS = [
     {"key": "color_transfer",    "label": "Color transfer",          "type": str,   "default": "none", "choices": ["none", "rct", "mkl"], "help": "Color transfer mode"},
     {"key": "model_preset",      "label": "Model preset",            "type": str,   "default": "medium", "choices": ["tiny", "small", "medium", "large"], "help": "Controls model size and VRAM"},
     {"key": "window_size",       "label": "Window size",             "type": int,   "default": 8,    "min": 4,   "max": 16,   "help": "Swin window attention size"},
-    {"key": "skip_strength",     "label": "Skip strength",           "type": float, "default": 0.5,  "min": 0.0, "max": 1.0,  "help": "Encoder skip connection strength"},
+    {"key": "ae_dims",          "label": "AE dims",                 "type": int,   "default": 256,  "min": 64,  "max": 512,  "help": "Inter bottleneck dimension (lower=stronger identity separation)"},
     {"key": "gradient_checkpoint","label": "Gradient checkpoint",    "type": bool,  "default": False, "help": "Trade compute for VRAM"},
     {"key": "eye_priority",      "label": "Eye priority",            "type": float, "default": 1.0,  "min": 0.5, "max": 5.0,  "help": "Eye region loss weight"},
     {"key": "mouth_priority",    "label": "Mouth priority",          "type": float, "default": 1.0,  "min": 0.5, "max": 5.0,  "help": "Mouth region loss weight"},
     {"key": "nose_priority",     "label": "Nose priority",           "type": float, "default": 1.0,  "min": 0.5, "max": 3.0,  "help": "Nose region loss weight"},
     {"key": "jaw_priority",      "label": "Jaw priority",            "type": float, "default": 1.0,  "min": 0.5, "max": 3.0,  "help": "Jaw region loss weight"},
-    {"key": "face_style_power",  "label": "Face style power",        "type": float, "default": 2.0,  "min": 0.0, "max": 5.0,  "help": "Swap face region loss weight"},
-    {"key": "bg_style_power",    "label": "BG style power",          "type": float, "default": 1.0,  "min": 0.0, "max": 5.0,  "help": "Swap background region loss weight"},
-    {"key": "perceptual_weight", "label": "Perceptual loss weight",   "type": float, "default": 0.0,  "min": 0.0, "max": 1.0,  "help": "VGG perceptual loss"},
-    {"key": "identity_weight",   "label": "Identity loss weight",    "type": float, "default": 0.0,  "min": 0.0, "max": 1.0,  "help": "ArcFace identity preservation"},
+    {"key": "face_style_power",  "label": "Face style power",        "type": float, "default": 5.0,  "min": 0.1, "max": 10.0,  "help": "Swap face identity loss weight"},
+    {"key": "bg_style_power",    "label": "BG style power",          "type": float, "default": 2.0,  "min": 0.0, "max": 10.0,  "help": "Swap background region loss weight"},
+    {"key": "perceptual_weight", "label": "Perceptual loss weight",   "type": float, "default": 0.0,  "min": 0.0, "max": 1.0,  "help": "VGG perceptual loss for self-reconstruction"},
     {"key": "uniform_yaw_sampling","label": "Uniform yaw sampling",  "type": bool,  "default": False, "help": "Uniform angle sampling"},
 ]
 
@@ -315,7 +323,37 @@ class ModelTrainer:
         random_warp: bool = True,
         gan_power: float = 0.0,
         random_hsv_power: float = 0.0,
+        **kwargs,
     ) -> None:
+        # Delegate SAEHD to the dedicated SAEHDTrainer (exact DFL reimplementation)
+        if model_type == ModelType.SAEHD:
+            from DeepFaceLab.business.saehd_trainer import SAEHDTrainer
+            trainer = SAEHDTrainer(device=self._device_str if hasattr(self, '_device_str') else "auto")
+            trainer.train(
+                src_aligned_dir=src_aligned_dir,
+                dst_aligned_dir=dst_aligned_dir,
+                model_dir=model_dir,
+                resolution=resolution,
+                architecture=architecture,
+                ae_dims=ae_dims,
+                e_dims=e_dims,
+                d_dims=d_dims,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                use_amp=use_amp,
+                random_warp=random_warp,
+                random_hsv_power=random_hsv_power,
+                gan_power=gan_power,
+                face_style_power=kwargs.get("face_style_power", 0.0),
+                bg_style_power=kwargs.get("bg_style_power", 0.0),
+                eyes_mouth_prio=kwargs.get("eyes_mouth_prio", False),
+                masked_training=kwargs.get("masked_training", True),
+                gradient_clip=kwargs.get("gradient_clip", False),
+                save_interval_min=save_interval_min,
+                preview_interval_sec=preview_interval_min * 60,
+            )
+            return
+
         device = self._resolve_device()
         src_dir = Path(src_aligned_dir)
         dst_dir = Path(dst_aligned_dir)

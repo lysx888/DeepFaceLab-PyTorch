@@ -283,8 +283,8 @@ class ModelMerger:
             depths=cfg.get("depths", [2, 2, 6, 2]),
             num_heads=cfg.get("num_heads", [3, 6, 12, 24]),
             window_size=cfg.get("window_size", 8),
+            ae_dims=cfg.get("ae_dims", 256),
             w_dim=cfg.get("w_dim", 512),
-            identity_dim=cfg.get("identity_dim", 512),
             gan_power=0.0,
             base_channels=cfg.get("base_channels", 512),
         ).to(device)
@@ -336,20 +336,9 @@ class ModelMerger:
         img_t = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
         img_t = img_t * 2.0 - 1.0
 
-        identity = torch.zeros(1, 512, dtype=torch.float32, device=device)
-        if meta.arcface_embedding is not None:
-            identity = torch.from_numpy(meta.arcface_embedding.astype(np.float32)).unsqueeze(0).to(device)
-        elif src_aligned_dir is not None:
-            src_images = FileManager.find_images(Path(src_aligned_dir))
-            if src_images:
-                src_img = cv2.imread(str(src_images[0]))
-                if src_img is not None:
-                    src_faces = adapter.detect_faces(src_img, max_num=1)
-                    if src_faces and src_faces[0].embedding is not None:
-                        identity = torch.from_numpy(src_faces[0].embedding.astype(np.float32)).unsqueeze(0).to(device)
-
         with torch.inference_mode():
-            pred = model(img_t, identity)
+            _, w_plus = model.encode(img_t)
+            pred = model.decode_src(w_plus)
 
         pred_np = ((pred.squeeze(0).permute(1, 2, 0).cpu().numpy() + 1.0) / 2.0 * 255).astype(np.uint8)
         pred_bgr = cv2.cvtColor(pred_np, cv2.COLOR_RGB2BGR)
