@@ -58,21 +58,21 @@ class FaceMetadata:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict) -> "FaceMetadata":
+    def from_dict(cls, data: dict, lightweight: bool = False) -> "FaceMetadata":
         lm = np.array(data["landmarks_106"], dtype=np.int64)
         if lm.shape != (LANDMARK_POINTS, 2):
             raise ValueError(f"landmarks_106 shape must be ({LANDMARK_POINTS}, 2), got {lm.shape}")
         ft = FaceType(data["face_type"])
         src_rect = data.get("source_rect")
-        src_lm = np.array(data["source_landmarks_106"], dtype=np.int64) if "source_landmarks_106" in data else None
-        mat = np.array(data["image_to_face_mat"], dtype=np.float32) if "image_to_face_mat" in data else None
+        src_lm = None if lightweight else (np.array(data["source_landmarks_106"], dtype=np.int64) if "source_landmarks_106" in data else None)
+        mat = None if lightweight else (np.array(data["image_to_face_mat"], dtype=np.float32) if "image_to_face_mat" in data else None)
         output_size = data.get("output_size", 512)
-        src_kps5 = np.array(data["source_kps_5"], dtype=np.float32) if "source_kps_5" in data else None
+        src_kps5 = None if lightweight else (np.array(data["source_kps_5"], dtype=np.float32) if "source_kps_5" in data else None)
         src_face_rect = data.get("source_face_rect")
         lm106_vis = data.get("landmarks_106_visibility", [True] * LANDMARK_POINTS)
         kps5_vis = data.get("kps_5_visibility", [True] * KPS5_POINTS)
         seg = data.get("seg_ie_polys")
-        arcface = np.array(data["arcface_embedding"], dtype=np.float32) if "arcface_embedding" in data else None
+        arcface = None if lightweight else (np.array(data["arcface_embedding"], dtype=np.float32) if "arcface_embedding" in data else None)
         yaw = data.get("yaw")
         return cls(
             landmarks_106=lm,
@@ -99,14 +99,14 @@ class MetadataManager:
         return image_path.with_suffix(".json")
 
     @staticmethod
-    def load(image_path: Path) -> Optional[FaceMetadata]:
+    def load(image_path: Path, lightweight: bool = False) -> Optional[FaceMetadata]:
         json_path = MetadataManager._sidecar_path(Path(image_path))
         if not json_path.exists():
             return None
         try:
             with open(str(json_path), "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return FaceMetadata.from_dict(data)
+            return FaceMetadata.from_dict(data, lightweight=lightweight)
         except (json.JSONDecodeError, ValueError, KeyError) as e:
             _logger.warning(f"Failed to load metadata from {json_path}: {e}")
             return None
@@ -118,13 +118,13 @@ class MetadataManager:
         FileManager.atomic_write(json_path, json_str)
 
     @staticmethod
-    def load_all(aligned_dir: Path) -> dict[str, FaceMetadata]:
+    def load_all(aligned_dir: Path, lightweight: bool = False) -> dict[str, FaceMetadata]:
         aligned_dir = Path(aligned_dir)
         result: dict[str, FaceMetadata] = {}
         if not aligned_dir.exists():
             return result
         for img_path in FileManager.find_images(aligned_dir):
-            meta = MetadataManager.load(img_path)
+            meta = MetadataManager.load(img_path, lightweight=lightweight)
             if meta is not None:
                 result[img_path.name] = meta
         return result
