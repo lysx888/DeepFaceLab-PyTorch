@@ -260,112 +260,73 @@ class NoiseInjection(nn.Module):
         return x
 
 
-class AdaINModule(nn.Module):
-    """FiLM-style identity modulation: (1 + gamma) * x + beta.
-    
-    Key insight from DFL analysis:
-    - DFL df: identity is in decoder WEIGHTS (strong, replaces entire decoder)
-    - DFL liae: identity is in channel HALVES (strong, replaces half the channels)
-    - We need identity to have REAL effect, not just a tiny perturbation
-    
-    FiLM (Feature-wise Linear Modulation) preserves spatial structure
-    while allowing identity to scale and shift each channel:
-    - gamma: identity-dependent per-channel scaling
-    - beta: identity-dependent per-channel shifting
-    - (1 + gamma) ensures identity=0 → identity transform at init
-    - Spatial structure from encoder/skip is preserved through scaling
-    """
-    def __init__(self, identity_dim: int = 512, w_dim: int = 512, feature_dim: int = 512) -> None:
+class Upscale(nn.Module):
+    """DFL-style upscale: Conv(k=3) → LeakyReLU(0.2) → PixelShuffle(2x)."""
+
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3) -> None:
         super().__init__()
-        self.identity_proj = nn.Sequential(nn.Linear(identity_dim, 256), nn.ReLU())
-        self.style_proj = nn.Sequential(nn.Linear(w_dim, 256), nn.ReLU())
-        self.modulation = nn.Linear(512, 2 * feature_dim)
-        # Zero-init modulation: start as identity transform
-        nn.init.zeros_(self.modulation.weight)
-        nn.init.zeros_(self.modulation.bias)
+        self.conv = nn.Conv2d(in_ch, out_ch * 4, kernel_size, padding=kernel_size // 2)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
 
-    def forward(self, x: torch.Tensor, identity_embed: torch.Tensor, w_style: torch.Tensor) -> torch.Tensor:
-        id_feat = self.identity_proj(identity_embed)
-        style_feat = self.style_proj(w_style)
-        combined = torch.cat([id_feat, style_feat], dim=1)
-        params = self.modulation(combined)
-        gamma, beta = params.chunk(2, dim=1)
-        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
-        beta = beta.unsqueeze(-1).unsqueeze(-1)
-        # FiLM: (1 + gamma) * x + beta
-        # At init: gamma=0, beta=0 → output = x (identity transform)
-        # During training: gamma/beta learn to modulate features by identity
-        return (1.0 + gamma) * x + beta
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act(self.conv(x))
+        B, C, H, W = x.shape
+        x = x.reshape(B, C // 4, 2, 2, H, W)
+        x = x.permute(0, 1, 4, 2, 5, 3).reshape(B, C // 4, H * 2, W * 2)
+        return x
 
 
-class SPADENorm(nn.Module):
-    def __init__(self, feature_nc: int, cond_nc: int) -> None:
+class ResBlock(nn.Module):
+    """DFL-style residual block: Conv → LReLU(0.2) → Conv → add → LReLU(0.2)."""
+
+    def __init__(self, ch: int, kernel_size: int = 3) -> None:
         super().__init__()
-        inter_nc = min(128, cond_nc)
-        self.mlp_shared = nn.Sequential(
-            nn.Conv2d(cond_nc, inter_nc, 3, 1, 1),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-        self.mlp_gamma = nn.Conv2d(inter_nc, feature_nc, 3, 1, 1)
-        self.mlp_beta = nn.Conv2d(inter_nc, feature_nc, 3, 1, 1)
-        nn.init.zeros_(self.mlp_gamma.weight)
-        nn.init.zeros_(self.mlp_gamma.bias)
-        nn.init.zeros_(self.mlp_beta.weight)
-        nn.init.zeros_(self.mlp_beta.bias)
+        self.conv1 = nn.Conv2d(ch, ch, kernel_size, padding=kernel_size // 2)
+        self.conv2 = nn.Conv2d(ch, ch, kernel_size, padding=kernel_size // 2)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        if x.shape[2:] != cond.shape[2:]:
-            cond = F.interpolate(cond, size=x.shape[2:], mode="bilinear", align_corners=False)
-        shared = self.mlp_shared(cond)
-        gamma = self.mlp_gamma(shared)
-        beta = self.mlp_beta(shared)
-        return x * (1.0 + gamma) + beta
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res = F.leaky_relu(self.conv1(x), 0.2)
+        res = self.conv2(res)
+        return F.leaky_relu(x + res, 0.2)
 
 
 class SynthesisLayer(nn.Module):
+    """Decoder layer: upsample → conv → style_mod → noise → activate.
+
+    DFL df-style: NO SPADE, NO skip connections.
+    Identity is in decoder WEIGHTS, not in any input signal.
+    The only input is the Inter code (structure/pose, identity-free).
+    """
+
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
         w_dim: int = 512,
-        identity_dim: int = 512,
         is_up: bool = True,
-        use_spade: bool = False,
-        spade_cond_nc: int = 0,
     ) -> None:
         super().__init__()
         self.is_up = is_up
         if is_up:
             self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.conv = nn.Conv2d(in_channels, out_channels, 3, 1, 1)
-        self.adain = AdaINModule(identity_dim, w_dim, out_channels)
-        self.spade = SPADENorm(out_channels, spade_cond_nc) if use_spade else None
+        self.style_proj = nn.Linear(w_dim, 2 * out_channels)
+        nn.init.zeros_(self.style_proj.weight)
+        nn.init.zeros_(self.style_proj.bias)
         self.noise = NoiseInjection()
         self.activation = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(
         self,
         x: torch.Tensor,
-        identity_embed: torch.Tensor,
         w_style: torch.Tensor,
-        skip: Optional[torch.Tensor] = None,
-        skip_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.is_up:
             x = self.upsample(x)
         x = self.conv(x)
-        # Add skip BEFORE identity injection
-        # Skip carries spatial structure (pose/expression) from encoder
-        if skip is not None:
-            if x.shape[2:] != skip.shape[2:]:
-                skip = F.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
-            x = x + skip
-        # FiLM-style identity modulation: (1+gamma)*x + beta
-        # Preserves spatial structure while injecting identity
-        x = self.adain(x, identity_embed, w_style)
-        # SPADE: spatial-adaptive refinement using skip features
-        if self.spade is not None and skip_feat is not None:
-            x = self.spade(x, skip_feat)
+        params = self.style_proj(w_style)
+        gamma, beta = params.chunk(2, dim=1)
+        x = (1.0 + gamma.unsqueeze(-1).unsqueeze(-1)) * x + beta.unsqueeze(-1).unsqueeze(-1)
         x = self.noise(x)
         x = self.activation(x)
         return x
@@ -381,137 +342,64 @@ class ToRGB(nn.Module):
 
 
 class TFMDecoder(nn.Module):
+    """DFL-style CNN spatial decoder.
+
+    Input: spatial feature map from Inter bottleneck (ae_dims @ res/16).
+    Identity is in DECODER WEIGHTS — each decoder (src/dst) only sees
+    one identity during training, so its weights encode that identity.
+
+    Architecture: project → Upscale → 3×(Upscale + ResBlock) → Conv1x1 → Tanh
+    Channel progression (ae_dims=256, d_dims=64, res=128):
+      Input: 256@8×8 → proj→512@8×8 → Upscale→512@16×16 → Res
+      → Upscale→256@32 → Res → Upscale→128@64 → Res
+      → Upscale→64@128 → Res → Conv1x1→3@128 → Tanh
+    """
+
     def __init__(
         self,
         resolution: int = 128,
-        w_dim: int = 512,
-        identity_dim: int = 512,
-        base_channels: int = 512,
-        encoder_dims: Optional[list[int]] = None,
-        gradient_checkpoint: bool = False,
-        skip_strength: float = 0.5,
+        ae_dims: int = 256,
+        d_dims: int = 64,
     ) -> None:
         super().__init__()
         self.resolution = resolution
-        self.w_dim = w_dim
-        self.num_layers = 7 if resolution >= 256 else 6
-        self.gradient_checkpoint = gradient_checkpoint
-        self.skip_strength = skip_strength
 
-        if encoder_dims is None:
-            encoder_dims = [96, 192, 384, 768]
-
-        self.num_enc_stages = len(encoder_dims)
-
-        self.const_input = ConstInput(base_channels, size=4)
-        self.bottleneck_proj = nn.Conv2d(encoder_dims[-1], base_channels, 1)
-
-        channels = base_channels
-        self.synthesis_layers = nn.ModuleList()
-        self.to_rgb_layers = nn.ModuleList()
-        self.skip_convs = nn.ModuleList()
-
-        self.to_rgb_layers.append(ToRGB(channels))
-
-        up_layers = self.num_layers
-        channel_schedule = []
-        ch = channels
-        for i in range(up_layers):
-            channel_schedule.append(ch)
-            if i >= 2 and ch > 32:
-                ch = max(ch // 2, 32)
-
-        for i in range(up_layers):
-            out_ch = channel_schedule[i + 1] if i + 1 < len(channel_schedule) else channel_schedule[-1]
-            in_ch = channel_schedule[i]
-
-            enc_idx = self.num_enc_stages - 2 - i
-            has_skip = 0 <= enc_idx < self.num_enc_stages
-            spade_cond_nc = out_ch if has_skip else 0
-
-            self.synthesis_layers.append(
-                SynthesisLayer(in_ch, out_ch, w_dim, identity_dim, is_up=True, use_spade=has_skip, spade_cond_nc=spade_cond_nc)
-            )
-            self.to_rgb_layers.append(ToRGB(out_ch))
-
-            if has_skip:
-                self.skip_convs.append(nn.Conv2d(encoder_dims[enc_idx], out_ch, 1))
-            else:
-                self.skip_convs.append(None)
-
-    def forward(
-        self,
-        w_plus: torch.Tensor,
-        identity_embed: torch.Tensor,
-        encoder_features: Optional[dict[str, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        B = w_plus.shape[0]
-        if encoder_features is not None:
-            bottleneck_key = f"stage{self.num_enc_stages}"
-            if bottleneck_key in encoder_features:
-                x = self.bottleneck_proj(encoder_features[bottleneck_key])
-            else:
-                x = self.const_input(B)
-        else:
-            x = self.const_input(B)
-
-        rgb = self.to_rgb_layers[0](x)
-
-        for i, layer in enumerate(self.synthesis_layers):
-            w_idx = min(i + 1, w_plus.shape[1] - 1)
-            w_style = w_plus[:, w_idx]
-
-            skip = None
-            skip_feat = None
-            if encoder_features is not None and i < len(self.skip_convs) and self.skip_convs[i] is not None:
-                enc_idx = self.num_enc_stages - 2 - i
-                enc_key = f"stage{enc_idx + 1}"
-                if enc_key in encoder_features:
-                    enc_feat = encoder_features[enc_key]
-                    projected = self.skip_convs[i](enc_feat)
-                    target_h = x.shape[2] * 2 if layer.is_up else x.shape[2]
-                    target_w = x.shape[3] * 2 if layer.is_up else x.shape[3]
-                    if projected.shape[2:] != (target_h, target_w):
-                        projected = F.interpolate(projected, size=(target_h, target_w), mode="bilinear", align_corners=False)
-                    if self.skip_strength > 0:
-                        skip = projected * self.skip_strength
-                        skip_feat = projected * self.skip_strength
-
-            x = layer(x, identity_embed, w_style, skip, skip_feat)
-            rgb_up = self.to_rgb_layers[i + 1](x)
-            if rgb.shape[2:] != rgb_up.shape[2:]:
-                rgb = F.interpolate(rgb, size=rgb_up.shape[2:], mode="bilinear", align_corners=False)
-            rgb = rgb + rgb_up
-
-        if rgb.shape[2] != self.resolution or rgb.shape[3] != self.resolution:
-            rgb = F.interpolate(rgb, size=(self.resolution, self.resolution), mode="bilinear", align_corners=False)
-
-        return torch.tanh(rgb)
-
-
-class IdentityEncoder(nn.Module):
-    def __init__(self, embed_dim: int = 512) -> None:
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 64, 7, 2, 3, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, 5, 2, 2, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, 3, 2, 1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, 3, 2, 1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
+        # Project ae_dims → d_dims*8 for decoder input
+        self.proj = nn.Sequential(
+            nn.Conv2d(ae_dims, d_dims * 8, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
         )
-        self.fc = nn.Linear(512, embed_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        x = F.adaptive_avg_pool2d(x, 1).flatten(1)
-        return F.normalize(self.fc(x), dim=1)
+        # Initial upscale: res/16 → res/8 (e.g. 8→16 for 128px)
+        self.upscale_init = Upscale(d_dims * 8, d_dims * 8)
+        self.res_init = ResBlock(d_dims * 8)
+
+        # Face branch: 3 upscale + resblock stages
+        self.upscale0 = Upscale(d_dims * 8, d_dims * 8)
+        self.res0 = ResBlock(d_dims * 8)
+        self.upscale1 = Upscale(d_dims * 8, d_dims * 4)
+        self.res1 = ResBlock(d_dims * 4)
+        self.upscale2 = Upscale(d_dims * 4, d_dims * 2)
+        self.res2 = ResBlock(d_dims * 2)
+        self.out_conv = nn.Conv2d(d_dims * 2, 3, kernel_size=1, padding=0)
+
+    def forward(self, spatial_feat: torch.Tensor) -> torch.Tensor:
+        x = self.proj(spatial_feat)
+        x = self.upscale_init(x)
+        x = self.res_init(x)
+        x = self.upscale0(x)
+        x = self.res0(x)
+        x = self.upscale1(x)
+        x = self.res1(x)
+        x = self.upscale2(x)
+        x = self.res2(x)
+        x = self.out_conv(x)
+
+        if x.shape[2] != self.resolution or x.shape[3] != self.resolution:
+            x = F.interpolate(x, size=(self.resolution, self.resolution),
+                              mode="bilinear", align_corners=False)
+        return torch.tanh(x)
+
 
 
 class WPlusMapper(nn.Module):
@@ -598,7 +486,69 @@ class VGGPerceptualLoss(nn.Module):
         return loss
 
 
+class TFMInter(nn.Module):
+    """Information bottleneck between encoder and decoder (DFL-style).
+
+    DFL's critical design: Dense(32768→256) compresses encoder output 128:1,
+    forcing identity out of the latent code. Identity can only be encoded
+    in decoder weights.
+
+    Our version:
+    1. Flatten encoder's deepest stage features
+    2. Dense compress to ae_dims (bottleneck!)
+    3. Dense expand to spatial feature map (bottleneck_res² × ae_dims)
+    4. Upscale 2x → output spatial feature map for CNN decoder
+
+    The compression ratio is the key: too small → lose structure info,
+    too large → identity leaks through. DFL uses 128:1 for 128px.
+    """
+
+    def __init__(
+        self,
+        encoder_out_dim: int,
+        ae_dims: int = 256,
+        lowest_dense_res: int = 8,
+    ) -> None:
+        super().__init__()
+        self.ae_dims = ae_dims
+        self.lowest_dense_res = lowest_dense_res
+
+        self.dense_compress = nn.Linear(encoder_out_dim, ae_dims)
+        expand_dim = lowest_dense_res * lowest_dense_res * ae_dims
+        self.dense_expand = nn.Linear(ae_dims, expand_dim)
+        self.upscale = Upscale(ae_dims, ae_dims)
+
+    def forward(self, encoder_features: dict[str, torch.Tensor], num_stages: int) -> torch.Tensor:
+        deepest_key = f"stage{num_stages}"
+        feat = encoder_features[deepest_key]
+        B = feat.shape[0]
+        x = feat.flatten(1)
+        x = self.dense_compress(x)
+        x = F.leaky_relu(x, 0.1)
+        x = self.dense_expand(x)
+        x = x.reshape(B, self.ae_dims, self.lowest_dense_res, self.lowest_dense_res)
+        x = self.upscale(x)  # 2x resolution: (B, ae_dims, res*2, res*2)
+        return x
+
+
 class TFMModel(nn.Module):
+    """TFM face swap model with Swin Transformer encoder + DFL CNN decoder.
+
+    Architecture:
+    - Shared encoder (Swin Transformer) extracts multi-scale features
+    - Inter bottleneck: Dense compress → ae_dims → Dense expand → spatial map → Upscale 2x
+      This FORCES identity out of the latent code (DFL's key insight)
+    - decoder_src / decoder_dst: DFL CNN decoder (Upscale + ResBlock)
+      Identity is in DECODER WEIGHTS, not in any embedding
+    - Swap: encoder(dst) → Inter → decoder_src → SRC face on DST structure
+
+    Why this works:
+    - Inter bottleneck compresses 128:1 → identity cannot survive in code
+    - CNN decoder takes spatial feature map → identity naturally encoded in conv weights
+    - decoder_src only trained on SRC → its weights encode SRC identity
+    - decoder_src(dst_code) = SRC appearance + DST structure = face swap
+    """
+
     def __init__(
         self,
         resolution: int = 128,
@@ -607,13 +557,11 @@ class TFMModel(nn.Module):
         depths: Optional[list[int]] = None,
         num_heads: Optional[list[int]] = None,
         window_size: int = 8,
-        w_dim: int = 512,
-        identity_dim: int = 512,
+        ae_dims: int = 256,
+        d_dims: int = 64,
         gan_power: float = 0.0,
-        base_channels: int = 512,
         drop_rate: float = 0.1,
         gradient_checkpoint: bool = False,
-        skip_strength: float = 0.5,
     ) -> None:
         super().__init__()
         if depths is None:
@@ -627,10 +575,9 @@ class TFMModel(nn.Module):
         self.depths = depths
         self.num_heads = num_heads
         self.window_size = window_size
-        self.w_dim = w_dim
-        self.identity_dim = identity_dim
+        self.ae_dims = ae_dims
+        self.d_dims = d_dims
         self.gan_power = gan_power
-        self.base_channels = base_channels
         self.gradient_checkpoint = gradient_checkpoint
 
         self.encoder = TFMEncoder(
@@ -644,56 +591,59 @@ class TFMModel(nn.Module):
         )
 
         last_dim = embed_dim * (2 ** (len(depths) - 1))
-        num_dec_layers = 7 if resolution >= 256 else 6
+        patches_res = resolution // 4
+        for _ in range(len(depths) - 1):
+            patches_res //= 2
+        encoder_out_dim = last_dim * patches_res * patches_res
 
-        self.wplus_mapper = WPlusMapper(
-            embed_dim_last=last_dim,
-            num_layers=num_dec_layers,
-            w_dim=w_dim,
+        self.inter = TFMInter(
+            encoder_out_dim=encoder_out_dim,
+            ae_dims=ae_dims,
+            lowest_dense_res=patches_res,
         )
 
-        encoder_dims = [embed_dim * (2 ** i) for i in range(len(depths))]
-
-        self.decoder = TFMDecoder(
+        self.decoder_src = TFMDecoder(
             resolution=resolution,
-            w_dim=w_dim,
-            identity_dim=identity_dim,
-            base_channels=base_channels,
-            encoder_dims=encoder_dims,
-            gradient_checkpoint=gradient_checkpoint,
-            skip_strength=skip_strength,
+            ae_dims=ae_dims,
+            d_dims=d_dims,
         )
+        self.decoder_dst = TFMDecoder(
+            resolution=resolution,
+            ae_dims=ae_dims,
+            d_dims=d_dims,
+        )
+
+        self.decoder = self.decoder_src
 
         self.discriminator = None
         if gan_power > 0:
             self.discriminator = TFMDiscriminator()
 
-    def forward(self, img: torch.Tensor, identity_embed: torch.Tensor) -> torch.Tensor:
-        result, _ = self.forward_with_features(img, identity_embed)
-        return result
-
     def encode(self, img: torch.Tensor) -> tuple[dict, torch.Tensor]:
         encoder_features = self.encoder(img)
-        stage4_feat = encoder_features[f"stage{len(self.depths)}"]
-        w_plus = self.wplus_mapper(stage4_feat)
+        w_plus = self.inter(encoder_features, len(self.depths))
         return encoder_features, w_plus
 
-    def decode(self, w_plus: torch.Tensor, identity_embed: torch.Tensor, encoder_features: dict) -> torch.Tensor:
-        return self.decoder(w_plus, identity_embed, encoder_features)
+    def decode_src(self, w_plus: torch.Tensor) -> torch.Tensor:
+        return self.decoder_src(w_plus)
+
+    def decode_dst(self, w_plus: torch.Tensor) -> torch.Tensor:
+        return self.decoder_dst(w_plus)
+
+    def forward(self, img: torch.Tensor, which: str = "src") -> torch.Tensor:
+        _, w_plus = self.encode(img)
+        decoder = self.decoder_src if which == "src" else self.decoder_dst
+        return decoder(w_plus)
 
     def forward_with_features(
         self,
         img: torch.Tensor,
-        identity_embed: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        encoder_features = self.encoder(img)
-        stage4_feat = encoder_features[f"stage{len(self.depths)}"]
-        w_plus = self.wplus_mapper(stage4_feat)
-        output = self.decoder(w_plus, identity_embed, encoder_features)
+        encoder_features, w_plus = self.encode(img)
+        output = self.decoder_src(w_plus)
         features = {
             "encoder_features": encoder_features,
             "w_plus": w_plus,
-            "stage4_feat": stage4_feat,
         }
         return output, features
 
@@ -706,10 +656,7 @@ class TFMModel(nn.Module):
         return self.encoder
 
     def get_decoder(self) -> TFMDecoder:
-        return self.decoder
-
-    def get_adain(self) -> AdaINModule:
-        return self.decoder
+        return self.decoder_src
 
     def get_discriminator(self) -> Optional[TFMDiscriminator]:
         return self.discriminator
@@ -722,8 +669,9 @@ class TFMModel(nn.Module):
         import io
         components = {
             "TFM_encoder": self.encoder,
-            "TFM_decoder": self.decoder,
-            "TFM_wplus_mapper": self.wplus_mapper,
+            "TFM_inter": self.inter,
+            "TFM_decoder_src": self.decoder_src,
+            "TFM_decoder_dst": self.decoder_dst,
         }
         if self.discriminator is not None:
             components["TFM_discriminator"] = self.discriminator
@@ -744,8 +692,9 @@ class TFMModel(nn.Module):
 
         components = {
             "TFM_encoder": self.encoder,
-            "TFM_decoder": self.decoder,
-            "TFM_wplus_mapper": self.wplus_mapper,
+            "TFM_inter": self.inter,
+            "TFM_decoder_src": self.decoder_src,
+            "TFM_decoder_dst": self.decoder_dst,
         }
         if self.discriminator is not None:
             components["TFM_discriminator"] = self.discriminator
@@ -770,14 +719,13 @@ class TFMModel(nn.Module):
             "depths": self.depths,
             "num_heads": self.num_heads,
             "window_size": self.window_size,
-            "w_dim": self.w_dim,
-            "identity_dim": self.identity_dim,
+            "ae_dims": self.ae_dims,
+            "d_dims": self.d_dims,
             "gan_power": self.gan_power,
-            "base_channels": self.base_channels,
         }
 
     @classmethod
-    def from_preset(cls, preset: str = "medium", resolution: int = 128, gan_power: float = 0.0, window_size: int = 8, identity_dim: int = 512, gradient_checkpoint: bool = False, **kwargs) -> "TFMModel":
+    def from_preset(cls, preset: str = "medium", resolution: int = 128, gan_power: float = 0.0, window_size: int = 8, ae_dims: int = 256, d_dims: int = 64, gradient_checkpoint: bool = False, **kwargs) -> "TFMModel":
         if preset not in _TFM_PRESETS:
             raise ValueError(f"Unknown preset: {preset}. Available: {list(_TFM_PRESETS.keys())}")
         cfg = _TFM_PRESETS[preset]
@@ -787,10 +735,9 @@ class TFMModel(nn.Module):
             depths=cfg["depths"],
             num_heads=cfg["num_heads"],
             window_size=window_size,
-            w_dim=cfg["w_dim"],
-            identity_dim=identity_dim,
+            ae_dims=ae_dims,
+            d_dims=d_dims,
             gan_power=gan_power,
-            base_channels=cfg["base_channels"],
             gradient_checkpoint=gradient_checkpoint,
             **kwargs,
         )

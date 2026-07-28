@@ -4,7 +4,27 @@ import torch
 import torch.nn as nn
 
 from DeepFaceLab.models.base_model import BaseModel
-from DeepFaceLab.models.saehd_model import ConvBlock, UpBlock
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, stride: int = 1, padding: int = 1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size, stride, padding, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.act = nn.LeakyReLU(0.1, inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.bn(self.conv(x)))
+
+
+class UpBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.conv = ConvBlock(in_ch, out_ch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(self.up(x))
 
 
 class AMPEncoder(nn.Module):
