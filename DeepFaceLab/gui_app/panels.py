@@ -1457,7 +1457,12 @@ class Step4Train(StepPanel):
         params = {}
         for pw in self._saehd_param_groups.values():
             params.update(pw.get_values())
+        from DeepFaceLab.gui_app.saehd_param_defs import SAEHD_HIDDEN_PARAMS, DFL_FACE_TYPE_MAP
         params.pop("face_type", None)
+        for k, v in SAEHD_HIDDEN_PARAMS.items():
+            params.setdefault(k, v)
+        ct_mode = params.get("ct_mode", "none")
+        params["random_ct"] = ct_mode != "none"
         return params
 
     def _collect_tfm_params(self) -> dict:
