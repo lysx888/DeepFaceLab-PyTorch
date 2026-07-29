@@ -96,11 +96,12 @@ def migrate_config(config: dict) -> dict:
 
     _NEW_PARAM_DEFAULTS = {
         "learn_mask": True,
-        "gan_patch_size": 0,
+        "gan_patch_size": 16,
         "random_ct_sample_size": 100,
         "random_ct": False,
         "ct_mode": "none",
-        "optimizer": "adabelief",
+        "optimizer": "adamw",
+        "d_mask_dims": 16,
     }
     for k, v in _NEW_PARAM_DEFAULTS.items():
         if k not in migrated:
@@ -237,17 +238,19 @@ class SAEHDTrainer:
         dst_aligned_dir: Path,
         model_dir: Path,
         resolution: int = 128,
-        architecture: str = "df",
+        architecture: str = "df-ud",
         ae_dims: int = 256,
-        e_dims: int = 64,
-        d_dims: int = 64,
+        e_dims: int = 32,
+        d_dims: int = 32,
+        d_mask_dims: int = 16,
         batch_size: int = 0,
         learning_rate: float = 5e-5,
-        optimizer: str = "adabelief",
+        optimizer: str = "adamw",
         use_amp: bool = True,
         random_warp: bool = True,
-        random_flip: bool = True,
-        random_hsv_power: float = 0.05,
+        random_src_flip: bool = False,
+        random_dst_flip: bool = True,
+        random_hsv_power: float = 0.0,
         random_ct: bool = False,
         ct_mode: str = "none",
         random_ct_sample_size: int = 100,
@@ -257,10 +260,10 @@ class SAEHDTrainer:
         eyes_mouth_prio: bool = False,
         masked_training: bool = True,
         gan_power: float = 0.0,
-        gradient_clip: bool = False,
+        clipgrad: bool = False,
         lr_dropout: str = "n",
         gan_dims: int = 16,
-        gan_patch_size: int = 0,
+        gan_patch_size: int = 16,
         pretrain: bool = False,
         blur_out_mask: bool = False,
         true_face_power: float = 0.0,
@@ -309,7 +312,8 @@ class SAEHDTrainer:
         if pretrain:
             gan_power = 0.0
             random_warp = False
-            random_flip = True
+            random_src_flip = True
+            random_dst_flip = True
             random_hsv_power = 0.0
             face_style_power = 0.0
             bg_style_power = 0.0
@@ -327,11 +331,11 @@ class SAEHDTrainer:
         # we handle HSV at the same level as DFL.
         src_ds = SAEHDDataset(src_dir, resolution=resolution, is_src=True, augment=True,
                              random_hsv_power=random_hsv_power, random_warp=random_warp,
-                             random_flip=random_flip, random_ct=random_ct, ct_mode=ct_mode,
+                             random_flip=random_src_flip, random_ct=random_ct, ct_mode=ct_mode,
                              uniform_yaw=uniform_yaw, src_face_scale=src_face_scale)
         dst_ds = SAEHDDataset(dst_dir, resolution=resolution, is_src=False, augment=True,
                              random_hsv_power=0.0, random_warp=random_warp,
-                             random_flip=random_flip, random_ct=random_ct, ct_mode=ct_mode,
+                             random_flip=random_dst_flip, random_ct=random_ct, ct_mode=ct_mode,
                              uniform_yaw=uniform_yaw)
 
         if random_ct and ct_mode != "none":
@@ -352,19 +356,25 @@ class SAEHDTrainer:
                                 drop_last=True, worker_init_fn=worker_init_fn if dl_cfg["num_workers"] > 0 else None,
                                 persistent_workers=dl_cfg["num_workers"] > 0)
 
-        # Optimizer: AdaBelief (DFL default) or Adam
         optimizer_name = optimizer
-        if optimizer_name == "adabelief":
+        if optimizer_name == "adamw":
+            opt_class = torch.optim.AdamW
+            _logger.info("Using AdamW optimizer")
+        elif optimizer_name == "adabelief":
             from DeepFaceLab.shared.adabelief import AdaBelief
             opt_class = AdaBelief
             _logger.info("Using AdaBelief optimizer")
+        elif optimizer_name == "rmsprop":
+            opt_class = torch.optim.RMSprop
+            _logger.info("Using RMSprop optimizer")
         else:
             opt_class = torch.optim.Adam
             _logger.info("Using Adam optimizer")
 
         # Create model
-        d_mask_dims = d_dims // 3 + (d_dims // 3) % 2
-        effective_gan_patch_size = gan_patch_size if gan_patch_size > 0 else None
+        if d_mask_dims <= 0:
+            d_mask_dims = d_dims // 3 + (d_dims // 3) % 2
+        effective_gan_patch_size = gan_patch_size if gan_patch_size > 0 else resolution // 8
         model = SAEHDModel(resolution=resolution, architecture=architecture,
                            ae_dims=ae_dims, e_dims=e_dims, d_dims=d_dims,
                            d_mask_dims=d_mask_dims, gan_dims=gan_dims,
@@ -616,10 +626,8 @@ class SAEHDTrainer:
                 # --- Face style loss (DFL style) ---
                 face_style_power_norm = face_style_power / 100.0
                 if face_style_power_norm != 0:
-                    style_mask = torch.clamp(src_mask_blur, 0, 1.0).detach()
-                    style_mask = style_mask.detach()
                     loss_src = loss_src + _style_loss(
-                        pred_src_dst_no_grad * style_mask,
+                        pred_src_dst_no_grad * pred_src_dstm.detach(),
                         pred_dst_dst.detach() * pred_dst_dstm.detach(),
                         gaussian_blur_radius=resolution // 8,
                         loss_weight=10000.0 * face_style_power_norm,
@@ -628,8 +636,7 @@ class SAEHDTrainer:
                 # --- Background style loss (DFL style) ---
                 bg_style_power_norm = bg_style_power / 100.0
                 if bg_style_power_norm != 0:
-                    style_mask_blur = torch.clamp(_gaussian_blur(src_mask_blur, mask_blur_sigma), 0, 1.0)
-                    style_mask_blur = style_mask_blur.detach()
+                    style_mask_blur = torch.clamp(src_mask_blur, 0, 1.0).detach()
                     style_anti_blur = 1.0 - style_mask_blur
 
                     target_dst_style_anti = dst_target * style_anti_blur
@@ -677,7 +684,7 @@ class SAEHDTrainer:
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
-            if gradient_clip:
+            if clipgrad:
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 

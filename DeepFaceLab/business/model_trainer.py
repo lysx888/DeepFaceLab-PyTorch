@@ -34,9 +34,10 @@ _SAEHD_PARAMS = [
     {"key": "face_type",        "label": "Face type",               "type": str,   "default": "whole_face", "choices": ["half", "full", "whole_face", "head", "mid_full"], "help": "half/full/whole_face/head (mid_full=extension)"},
     {"key": "batch_size",       "label": "Batch size",              "type": int,   "default": 0,    "min": 0,   "max": 64,   "help": "0=auto-detect by VRAM. 4GB->4, 8GB+->8"},
     {"key": "learning_rate",    "label": "Learning rate",           "type": float, "default": 5e-5, "min": 1e-6, "max": 1e-2, "help": "Typical: 5e-5 (DFL default)"},
-    {"key": "optimizer",        "label": "Optimizer",               "type": str,   "default": "adabelief", "choices": ["adabelief", "adam"], "help": "adabelief: more stable (DFL default). adam: standard"},
+    {"key": "optimizer",        "label": "Optimizer",               "type": str,   "default": "adamw", "choices": ["adamw", "adabelief", "adam", "rmsprop"], "help": "adamw: PyTorch modern default. adabelief: DFL default. adam: standard. rmsprop: DFL fallback"},
     {"key": "random_warp",      "label": "Enable random warp",      "type": bool,  "default": True, "help": "Required for generalization. Disable for extra sharpness late in training"},
-    {"key": "random_flip",      "label": "Random flip",             "type": bool,  "default": True, "help": "Random horizontal flip"},
+    {"key": "random_src_flip",   "label": "Random src flip",         "type": bool,  "default": False, "help": "Random horizontal flip for src faceset. DFL default: False"},
+    {"key": "random_dst_flip",   "label": "Random dst flip",         "type": bool,  "default": True,  "help": "Random horizontal flip for dst faceset. DFL default: True"},
     {"key": "random_hsv_power", "label": "Random hue/sat/light",    "type": float, "default": 0.0, "min": 0.0, "max": 0.3,  "help": "Stabilizes color. Typical: 0.05 (DFL default)"},
     {"key": "lr_dropout",       "label": "LR dropout",              "type": str,   "default": "n",  "choices": ["n", "y", "cpu"], "help": "n=off, y=on, cpu=on(CPU masks). Extra sharpness late in training"},
     {"key": "pretrain",         "label": "Pretrain mode",           "type": bool,  "default": False,"help": "Pretrain with various faces. Forces warp=N, GAN=0, styles=0"},
@@ -51,10 +52,10 @@ _SAEHD_PARAMS = [
     {"key": "gradient_clip",    "label": "Gradient clipping [ext]",  "type": bool,  "default": False,"help": "Reduces chance of model collapse"},
     {"key": "save_interval_min", "label": "Save interval (min) [ext]", "type": float, "default": 15.0, "min": 1.0, "max": 120.0, "help": "Auto-save interval in minutes"},
     {"key": "preview_interval_sec", "label": "Preview interval (sec) [ext]", "type": float, "default": 60.0, "min": 10.0, "max": 600.0, "help": "Preview update interval in seconds"},
-    {"key": "architecture",     "label": "AE architecture",         "type": str,   "default": "df", "choices": ["df", "liae", "df-d", "liae-d", "df-ud", "liae-ud", "df-udt", "liae-udt", "df-t", "liae-t", "df-td", "liae-td"], "help": "df=identity, liae=different shapes, -d=depth_to_space, -t=true_face, -u=pixel_norm"},
+    {"key": "architecture",     "label": "AE architecture",         "type": str,   "default": "df-ud", "choices": ["df", "liae", "df-d", "liae-d", "df-ud", "liae-ud", "df-udt", "liae-udt", "df-t", "liae-t", "df-td", "liae-td"], "help": "df=identity, liae=different shapes, -d=depth_to_space, -t=true_face, -u=pixel_norm"},
     {"key": "ae_dims",          "label": "AutoEncoder dimensions",  "type": int,   "default": 256, "min": 32,  "max": 1024, "help": "More dims = better quality but more VRAM"},
-    {"key": "e_dims",           "label": "Encoder dimensions",      "type": int,   "default": 64,   "min": 16,  "max": 256, "help": "More dims = sharper result but more VRAM"},
-    {"key": "d_dims",           "label": "Decoder dimensions",      "type": int,   "default": 64,   "min": 16,  "max": 256, "help": "More dims = sharper result but more VRAM"},
+    {"key": "e_dims",           "label": "Encoder dimensions",      "type": int,   "default": 32,   "min": 16,  "max": 256, "help": "More dims = sharper result but more VRAM"},
+    {"key": "d_dims",           "label": "Decoder dimensions",      "type": int,   "default": 32,   "min": 16,  "max": 256, "help": "More dims = sharper result but more VRAM"},
     {"key": "learn_mask",       "label": "Learn mask",              "type": bool,  "default": True, "help": "Train mask branch. False=skip mask loss but decoder still outputs mask"},
     {"key": "eyes_mouth_prio",  "label": "Eyes and mouth priority", "type": bool,  "default": False,"help": "Helps fix eye problems and teeth detail"},
     {"key": "masked_training",  "label": "Masked training",         "type": bool,  "default": True, "help": "Clip training area to face mask"},
@@ -361,10 +362,11 @@ class ModelTrainer:
                 d_dims=d_dims,
                 batch_size=batch_size,
                 learning_rate=learning_rate,
-                optimizer=kwargs.get("optimizer", "adabelief"),
+                optimizer=kwargs.get("optimizer", "adamw"),
                 use_amp=kwargs.get("use_amp", True),
                 random_warp=random_warp,
-                random_flip=kwargs.get("random_flip", True),
+                random_src_flip=kwargs.get("random_src_flip", False),
+                random_dst_flip=kwargs.get("random_dst_flip", True),
                 random_hsv_power=random_hsv_power,
                 random_ct=kwargs.get("random_ct", False),
                 ct_mode=kwargs.get("ct_mode", "rct"),
@@ -438,7 +440,16 @@ class ModelTrainer:
         all_params = list(encoder.parameters()) + list(decoder_src.parameters()) + list(decoder_dst.parameters())
         if inter is not None:
             all_params += list(inter.parameters())
-        optimizer = torch.optim.Adam(all_params, lr=learning_rate)
+        optimizer_name = kwargs.get("optimizer", "adamw")
+        if optimizer_name == "adamw":
+            optimizer = torch.optim.AdamW(all_params, lr=learning_rate)
+        elif optimizer_name == "adabelief":
+            from DeepFaceLab.shared.adabelief import AdaBelief
+            optimizer = AdaBelief(all_params, lr=learning_rate)
+        elif optimizer_name == "rmsprop":
+            optimizer = torch.optim.RMSprop(all_params, lr=learning_rate)
+        else:
+            optimizer = torch.optim.Adam(all_params, lr=learning_rate)
 
         scaler = None
         if use_amp and device.type == "cuda":
