@@ -31,32 +31,43 @@ class ModelType(Enum):
 
 _SAEHD_PARAMS = [
     {"key": "resolution",       "label": "Resolution",              "type": int,   "default": 128,  "min": 64,  "max": 640,  "help": "Higher resolution = more VRAM. Adjusted to multiple of 16."},
-    {"key": "face_type",        "label": "Face type",               "type": str,   "default": "whole_face", "choices": ["half", "mid_full", "full", "whole_face", "head"], "help": "half/mid_full/full/whole_face/head"},
-    {"key": "architecture",     "label": "AE architecture",         "type": str,   "default": "df", "choices": ["df", "liae", "df-d", "liae-d", "df-ud", "liae-ud", "df-udt", "liae-udt"], "help": "df = more identity, liae = can fix different face shapes"},
+    {"key": "face_type",        "label": "Face type",               "type": str,   "default": "whole_face", "choices": ["half", "full", "whole_face", "head", "mid_full"], "help": "half/full/whole_face/head (mid_full=extension)"},
+    {"key": "batch_size",       "label": "Batch size",              "type": int,   "default": 0,    "min": 0,   "max": 64,   "help": "0=auto-detect by VRAM. 4GB->4, 8GB+->8"},
+    {"key": "learning_rate",    "label": "Learning rate",           "type": float, "default": 5e-5, "min": 1e-6, "max": 1e-2, "help": "Typical: 5e-5 (DFL default)"},
+    {"key": "optimizer",        "label": "Optimizer",               "type": str,   "default": "adabelief", "choices": ["adabelief", "adam"], "help": "adabelief: more stable (DFL default). adam: standard"},
+    {"key": "random_warp",      "label": "Enable random warp",      "type": bool,  "default": True, "help": "Required for generalization. Disable for extra sharpness late in training"},
+    {"key": "random_flip",      "label": "Random flip",             "type": bool,  "default": True, "help": "Random horizontal flip"},
+    {"key": "random_hsv_power", "label": "Random hue/sat/light",    "type": float, "default": 0.0, "min": 0.0, "max": 0.3,  "help": "Stabilizes color. Typical: 0.05 (DFL default)"},
+    {"key": "lr_dropout",       "label": "LR dropout",              "type": str,   "default": "n",  "choices": ["n", "y", "cpu"], "help": "n=off, y=on, cpu=on(CPU masks). Extra sharpness late in training"},
+    {"key": "pretrain",         "label": "Pretrain mode",           "type": bool,  "default": False,"help": "Pretrain with various faces. Forces warp=N, GAN=0, styles=0"},
+    {"key": "random_ct",        "label": "Random color transfer",   "type": bool,  "default": False,"help": "Apply random color transfer from dst samples to src during training"},
+    {"key": "ct_mode",          "label": "Color transfer mode",     "type": str,   "default": "none", "choices": ["none", "rct", "mkl", "lct", "idt", "sot-m"], "help": "rct=Reinhard, mkl=Monge-Kantorovich, lct=linear, idt=histogram, sot-m=optimal transport"},
+    {"key": "random_ct_sample_size", "label": "CT sample size",    "type": int,   "default": 100,  "min": 10,  "max": 500,  "help": "Number of dst samples for color transfer pool"},
+    {"key": "ca_weights",       "label": "CA weight init",          "type": bool,  "default": False,"help": "Convolution Aware weight initialization (Gabor filters)"},
+    {"key": "target_iter",      "label": "Target iterations",       "type": int,   "default": 0,   "min": 0,   "max": 9999999,"help": "Stop at this iteration. 0=unlimited"},
+    {"key": "autobackup_hour",  "label": "Autobackup (hours)",      "type": int,   "default": 0,   "min": 0,   "max": 24,   "help": "Auto backup every N hours. 0=disabled. Keeps last 15"},
+    {"key": "write_preview_history", "label": "Save preview history", "type": bool, "default": False,"help": "Save preview images to preview_history/ folder"},
+    {"key": "use_amp",          "label": "Use AMP (mixed precision) [ext]", "type": bool,  "default": True, "help": "Faster training, less VRAM"},
+    {"key": "gradient_clip",    "label": "Gradient clipping [ext]",  "type": bool,  "default": False,"help": "Reduces chance of model collapse"},
+    {"key": "save_interval_min", "label": "Save interval (min) [ext]", "type": float, "default": 15.0, "min": 1.0, "max": 120.0, "help": "Auto-save interval in minutes"},
+    {"key": "preview_interval_sec", "label": "Preview interval (sec) [ext]", "type": float, "default": 60.0, "min": 10.0, "max": 600.0, "help": "Preview update interval in seconds"},
+    {"key": "architecture",     "label": "AE architecture",         "type": str,   "default": "df", "choices": ["df", "liae", "df-d", "liae-d", "df-ud", "liae-ud", "df-udt", "liae-udt", "df-t", "liae-t", "df-td", "liae-td"], "help": "df=identity, liae=different shapes, -d=depth_to_space, -t=true_face, -u=pixel_norm"},
     {"key": "ae_dims",          "label": "AutoEncoder dimensions",  "type": int,   "default": 256, "min": 32,  "max": 1024, "help": "More dims = better quality but more VRAM"},
     {"key": "e_dims",           "label": "Encoder dimensions",      "type": int,   "default": 64,   "min": 16,  "max": 256, "help": "More dims = sharper result but more VRAM"},
     {"key": "d_dims",           "label": "Decoder dimensions",      "type": int,   "default": 64,   "min": 16,  "max": 256, "help": "More dims = sharper result but more VRAM"},
-    {"key": "batch_size",       "label": "Batch size",              "type": int,   "default": 8,    "min": 1,   "max": 64,   "help": "Higher = more VRAM. 4GB VRAM -> 4, 8GB+ -> 8"},
-    {"key": "learning_rate",    "label": "Learning rate",           "type": float, "default": 5e-5, "min": 1e-6, "max": 1e-2, "help": "Typical: 5e-5 (DFL default)"},
-    {"key": "adabelief",        "label": "Use AdaBelief optimizer", "type": bool,  "default": True, "help": "AdaBelief: more stable than Adam. DFL default"},
-    {"key": "use_amp",          "label": "Use AMP (mixed precision)", "type": bool, "default": True, "help": "Faster training, less VRAM"},
-    {"key": "random_warp",      "label": "Enable random warp",      "type": bool,  "default": True, "help": "Required for generalization. Disable for extra sharpness late in training"},
-    {"key": "random_flip",      "label": "Random flip",             "type": bool,  "default": True, "help": "Random horizontal flip"},
-    {"key": "random_hsv_power", "label": "Random hue/sat/light",    "type": float, "default": 0.0, "min": 0.0, "max": 0.3,  "help": "Stabilizes color. Typical: 0.05"},
-    {"key": "color_transfer",   "label": "Color transfer",          "type": str,   "default": "none", "choices": ["none", "rct", "mkl"], "help": "Color transfer mode"},
-    {"key": "face_style_power", "label": "Face style power",        "type": float, "default": 0.0, "min": 0.0, "max": 100.0,"help": "Learn face color from dst. Enable after 10k iters. Typical: 10.0"},
-    {"key": "bg_style_power",   "label": "BG style power",          "type": float, "default": 0.0, "min": 0.0, "max": 100.0,"help": "Learn bg color from dst. Typical: 10.0"},
+    {"key": "learn_mask",       "label": "Learn mask",              "type": bool,  "default": True, "help": "Train mask branch. False=skip mask loss but decoder still outputs mask"},
     {"key": "eyes_mouth_prio",  "label": "Eyes and mouth priority", "type": bool,  "default": False,"help": "Helps fix eye problems and teeth detail"},
     {"key": "masked_training",  "label": "Masked training",         "type": bool,  "default": True, "help": "Clip training area to face mask"},
+    {"key": "blur_out_mask",    "label": "Blur out mask",           "type": bool,  "default": False,"help": "Blur background near mask edge for smoother swap"},
+    {"key": "src_face_scale",   "label": "Src face scale %",        "type": int,   "default": 0,   "min": -30, "max": 30,   "help": "Scale src face region. Negative=smaller, positive=larger"},
+    {"key": "face_style_power", "label": "Face style power",        "type": float, "default": 0.0, "min": 0.0, "max": 100.0,"help": "Learn face color from dst. Enable after 10k iters. Typical: 10.0"},
+    {"key": "bg_style_power",   "label": "BG style power",          "type": float, "default": 0.0, "min": 0.0, "max": 100.0,"help": "Learn bg color from dst. Typical: 10.0"},
+    {"key": "true_face_power",  "label": "True face power",         "type": float, "default": 0.0, "min": 0.0, "max": 1.0,  "help": "Code-level discrimination. df only. Typical: 0.01"},
+    {"key": "pixel_loss",       "label": "Pixel loss (after 20k)",   "type": bool,  "default": False,"help": "Add L1 pixel loss after 20k iterations for more detail"},
     {"key": "gan_power",        "label": "GAN power",               "type": float, "default": 0.0, "min": 0.0, "max": 5.0,  "help": "0=off. Typical fine value 0.1. Enable only when face is trained enough"},
     {"key": "gan_dims",         "label": "GAN dimensions",          "type": int,   "default": 16,  "min": 8,   "max": 64,   "help": "Discriminator base channels"},
-    {"key": "gradient_clip",    "label": "Gradient clipping",       "type": bool,  "default": False,"help": "Reduces chance of model collapse"},
-    {"key": "lr_dropout",       "label": "LR dropout",              "type": str,   "default": "n",  "choices": ["n", "y", "cpu"], "help": "n=off, y=on, cpu=on(CPU masks). Extra sharpness late in training"},
-    {"key": "pretrain",         "label": "Pretrain mode",           "type": bool,  "default": False,"help": "Pretrain with various faces. Forces warp=N, GAN=0, styles=0"},
-    {"key": "blur_out_mask",    "label": "Blur out mask",           "type": bool,  "default": False,"help": "Blur background near mask edge for smoother swap"},
-    {"key": "true_face_power",  "label": "True face power",         "type": float, "default": 0.0, "min": 0.0, "max": 1.0, "help": "Code-level discrimination. df only. Typical: 0.01"},
-    {"key": "save_interval_min", "label": "Save interval (min)",    "type": float, "default": 15.0, "min": 1.0, "max": 120.0, "help": "Auto-save interval in minutes"},
-    {"key": "preview_interval_sec", "label": "Preview interval (sec)", "type": float, "default": 60.0, "min": 10.0, "max": 600.0, "help": "Preview update interval in seconds"},
+    {"key": "gan_patch_size",   "label": "GAN patch size",          "type": int,   "default": 0,   "min": 0,   "max": 128,  "help": "0=auto-derive(max(8,res//8)). Set >0 for manual override"},
+    {"key": "uniform_yaw",      "label": "Uniform yaw sampling",    "type": bool,  "default": False,"help": "Sample faces uniformly across yaw angles for better side-profile results"},
 ]
 
 _QUICK96_PARAMS = [
@@ -161,7 +172,11 @@ class ModelTrainer:
         if config_path.exists():
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    config = json.load(f)
+                if model_type == ModelType.SAEHD:
+                    from DeepFaceLab.business.saehd_trainer import migrate_config
+                    config = migrate_config(config)
+                return config
             except Exception:
                 pass
         return None
@@ -314,7 +329,7 @@ class ModelTrainer:
         dst_aligned_dir: Path,
         model_dir: Path,
         resolution: int = 128,
-        batch_size: int = 4,
+        batch_size: int = 0,
         learning_rate: float = 1e-4,
         use_amp: bool = True,
         save_interval_min: float = 15.0,
@@ -328,7 +343,7 @@ class ModelTrainer:
         d_dims: int = 64,
         random_warp: bool = True,
         gan_power: float = 0.0,
-        random_hsv_power: float = 0.0,
+        random_hsv_power: float = 0.05,
         **kwargs,
     ) -> None:
         # Delegate SAEHD to the dedicated SAEHDTrainer (exact DFL reimplementation)
@@ -346,12 +361,18 @@ class ModelTrainer:
                 d_dims=d_dims,
                 batch_size=batch_size,
                 learning_rate=learning_rate,
-                adabelief=kwargs.get("adabelief", True),
-                use_amp=use_amp,
+                optimizer=kwargs.get("optimizer", "adabelief"),
+                use_amp=kwargs.get("use_amp", True),
                 random_warp=random_warp,
+                random_flip=kwargs.get("random_flip", True),
                 random_hsv_power=random_hsv_power,
+                random_ct=kwargs.get("random_ct", False),
+                ct_mode=kwargs.get("ct_mode", "rct"),
+                random_ct_sample_size=kwargs.get("random_ct_sample_size", 100),
+                learn_mask=kwargs.get("learn_mask", True),
                 gan_power=gan_power,
                 gan_dims=kwargs.get("gan_dims", 16),
+                gan_patch_size=kwargs.get("gan_patch_size", 0),
                 face_style_power=kwargs.get("face_style_power", 0.0),
                 bg_style_power=kwargs.get("bg_style_power", 0.0),
                 eyes_mouth_prio=kwargs.get("eyes_mouth_prio", False),
@@ -362,6 +383,12 @@ class ModelTrainer:
                 blur_out_mask=kwargs.get("blur_out_mask", False),
                 true_face_power=kwargs.get("true_face_power", 0.0),
                 uniform_yaw=kwargs.get("uniform_yaw", False),
+                src_face_scale=kwargs.get("src_face_scale", 0),
+                pixel_loss=kwargs.get("pixel_loss", False),
+                ca_weights=kwargs.get("ca_weights", False),
+                target_iter=kwargs.get("target_iter", 0),
+                autobackup_hour=kwargs.get("autobackup_hour", 0),
+                write_preview_history=kwargs.get("write_preview_history", False),
                 save_interval_min=save_interval_min,
                 preview_interval_sec=preview_interval_min * 60,
             )

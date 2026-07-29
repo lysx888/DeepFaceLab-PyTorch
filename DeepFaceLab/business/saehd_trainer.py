@@ -66,37 +66,90 @@ _MODEL_PREFIX = "SAEHD"
 _SAVE_INTERVAL_SEC = 1200
 
 
+def migrate_config(config: dict) -> dict:
+    """Migrate old config keys to new DFL-aligned keys.
+
+    - adabelief(bool) -> optimizer(str): True->"adabelief", False->"adam"
+    - color_transfer(str) -> random_ct(bool) + ct_mode(str): "none"->False; other->True,ct_mode=value
+    - Add missing new params with defaults
+    """
+    migrated = dict(config)
+    changed = False
+
+    if "adabelief" in migrated and "optimizer" not in migrated:
+        adabelief_val = migrated.pop("adabelief")
+        migrated["optimizer"] = "adabelief" if adabelief_val else "adam"
+        changed = True
+
+    if "color_transfer" in migrated and "random_ct" not in migrated:
+        ct_val = migrated.pop("color_transfer")
+        if ct_val == "none":
+            migrated["random_ct"] = False
+            migrated["ct_mode"] = "rct"
+        else:
+            migrated["random_ct"] = True
+            ct_mode_val = ct_val
+            if ct_mode_val == "sot":
+                ct_mode_val = "sot-m"
+            migrated["ct_mode"] = ct_mode_val
+        changed = True
+
+    _NEW_PARAM_DEFAULTS = {
+        "learn_mask": True,
+        "gan_patch_size": 0,
+        "random_ct_sample_size": 100,
+        "random_ct": False,
+        "ct_mode": "none",
+        "optimizer": "adabelief",
+    }
+    for k, v in _NEW_PARAM_DEFAULTS.items():
+        if k not in migrated:
+            migrated[k] = v
+            changed = True
+
+    if changed:
+        _logger.info("检测到旧版配置，已自动转换参数格式")
+
+    return migrated
+
+
 # ---------------------------------------------------------------------------
 # Loss functions (exact DFL implementations)
 # ---------------------------------------------------------------------------
 
 def _dssim(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0, filter_size: int = 11) -> torch.Tensor:
-    """DFL's DSSIM: 1 - SSIM, using uniform averaging filter."""
+    """DFL's DSSIM: (1 - SSIM) / 2.0, using Gaussian kernel (softmax normalized)."""
     C1 = (0.01 * max_val) ** 2
     C2 = (0.03 * max_val) ** 2
+    filter_sigma = 1.5
 
-    padding = filter_size // 2
     channels = pred.shape[1]
-    kernel = torch.ones(1, 1, filter_size, filter_size, device=pred.device, dtype=pred.dtype) / (filter_size * filter_size)
-    kernel = kernel.expand(channels, 1, -1, -1)
+    coords = torch.arange(filter_size, device=pred.device, dtype=pred.dtype) - (filter_size - 1) / 2.0
+    coords_sq = coords ** 2
+    kernel_2d = (-0.5 / (filter_sigma ** 2)) * (coords_sq.unsqueeze(0) + coords_sq.unsqueeze(1))
+    kernel_2d = torch.softmax(kernel_2d.view(-1), dim=0).view(1, 1, filter_size, filter_size)
+    kernel = kernel_2d.expand(channels, 1, -1, -1)
 
-    mu_pred = F.conv2d(pred, kernel, padding=padding, groups=channels)
-    mu_target = F.conv2d(target, kernel, padding=padding, groups=channels)
+    mu_pred = F.conv2d(pred, kernel, padding=0, groups=channels)
+    mu_target = F.conv2d(target, kernel, padding=0, groups=channels)
 
     mu_pred_sq = mu_pred ** 2
     mu_target_sq = mu_target ** 2
     mu_cross = mu_pred * mu_target
 
-    sigma_pred_sq = F.conv2d(pred ** 2, kernel, padding=padding, groups=channels) - mu_pred_sq
-    sigma_target_sq = F.conv2d(target ** 2, kernel, padding=padding, groups=channels) - mu_target_sq
-    sigma_cross = F.conv2d(pred * target, kernel, padding=padding, groups=channels) - mu_cross
+    sigma_cross = F.conv2d(pred * target, kernel, padding=0, groups=channels) - mu_cross
+    sigma_pred_sq = F.conv2d(pred ** 2, kernel, padding=0, groups=channels) - mu_pred_sq
+    sigma_target_sq = F.conv2d(target ** 2, kernel, padding=0, groups=channels) - mu_target_sq
 
     sigma_pred_sq = torch.clamp(sigma_pred_sq, min=0.0)
     sigma_target_sq = torch.clamp(sigma_target_sq, min=0.0)
 
-    ssim_map = ((2 * mu_cross + C1) * (2 * sigma_cross + C2)) / \
-               ((mu_pred_sq + mu_target_sq + C1) * (sigma_pred_sq + sigma_target_sq + C2))
-    return 1.0 - ssim_map
+    # Standard SSIM decomposition (numerically stable for AMP fp16)
+    luminance = (2.0 * mu_cross + C1) / (mu_pred_sq + mu_target_sq + C1)
+    cs = (2.0 * sigma_cross + C2) / (sigma_pred_sq + sigma_target_sq + C2)
+
+    ssim_val = (luminance * cs).mean(dim=[2, 3])
+    return (1.0 - ssim_val) / 2.0
 
 
 def _gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
@@ -188,14 +241,17 @@ class SAEHDTrainer:
         ae_dims: int = 256,
         e_dims: int = 64,
         d_dims: int = 64,
-        batch_size: int = 8,
+        batch_size: int = 0,
         learning_rate: float = 5e-5,
-        adabelief: bool = True,
+        optimizer: str = "adabelief",
         use_amp: bool = True,
         random_warp: bool = True,
         random_flip: bool = True,
-        random_hsv_power: float = 0.0,
-        color_transfer: str = "none",
+        random_hsv_power: float = 0.05,
+        random_ct: bool = False,
+        ct_mode: str = "none",
+        random_ct_sample_size: int = 100,
+        learn_mask: bool = True,
         face_style_power: float = 0.0,
         bg_style_power: float = 0.0,
         eyes_mouth_prio: bool = False,
@@ -204,11 +260,17 @@ class SAEHDTrainer:
         gradient_clip: bool = False,
         lr_dropout: str = "n",
         gan_dims: int = 16,
-        gan_patch_size: int = None,
+        gan_patch_size: int = 0,
         pretrain: bool = False,
         blur_out_mask: bool = False,
         true_face_power: float = 0.0,
         uniform_yaw: bool = False,
+        src_face_scale: int = 0,
+        pixel_loss: bool = False,
+        ca_weights: bool = False,
+        target_iter: int = 0,
+        autobackup_hour: int = 0,
+        write_preview_history: bool = False,
         save_interval_min: float = 15.0,
         preview_interval_sec: float = 60,
         on_iter: Optional[Callable] = None,
@@ -224,6 +286,24 @@ class SAEHDTrainer:
         src_dir = Path(src_aligned_dir)
         dst_dir = Path(dst_aligned_dir)
         model_dir = Path(model_dir)
+
+        # Auto-detect batch size if 0 (DFL behavior)
+        if batch_size == 0:
+            if device.type == "cuda":
+                try:
+                    gpu_mem = getattr(torch.cuda.get_device_properties(0), 'total_memory',
+                                      getattr(torch.cuda.get_device_properties(0), 'total_mem', 0)) / 1024 ** 3
+                    if gpu_mem >= 8:
+                        batch_size = 8
+                    elif gpu_mem >= 4:
+                        batch_size = 4
+                    else:
+                        batch_size = 2
+                except Exception:
+                    batch_size = 4
+            else:
+                batch_size = 2
+            _logger.info(f"Auto-detected batch_size: {batch_size}")
 
         # Pretrain mode: force override training parameters (DFL behavior)
         if pretrain:
@@ -247,15 +327,15 @@ class SAEHDTrainer:
         # we handle HSV at the same level as DFL.
         src_ds = SAEHDDataset(src_dir, resolution=resolution, is_src=True, augment=True,
                              random_hsv_power=random_hsv_power, random_warp=random_warp,
-                             random_flip=random_flip, color_transfer=color_transfer,
-                             uniform_yaw=uniform_yaw)
+                             random_flip=random_flip, random_ct=random_ct, ct_mode=ct_mode,
+                             uniform_yaw=uniform_yaw, src_face_scale=src_face_scale)
         dst_ds = SAEHDDataset(dst_dir, resolution=resolution, is_src=False, augment=True,
                              random_hsv_power=0.0, random_warp=random_warp,
-                             random_flip=random_flip, color_transfer=color_transfer,
+                             random_flip=random_flip, random_ct=random_ct, ct_mode=ct_mode,
                              uniform_yaw=uniform_yaw)
 
-        if color_transfer != "none":
-            ct_pool = dst_ds.build_ct_sample_pool(n=100)
+        if random_ct and ct_mode != "none":
+            ct_pool = dst_ds.build_ct_sample_pool(n=random_ct_sample_size)
             src_ds._ct_sample_pool = ct_pool
 
         dl_cfg = get_dataloader_config("gpu_train" if device.type == "cuda" else "cpu_train",
@@ -272,12 +352,28 @@ class SAEHDTrainer:
                                 drop_last=True, worker_init_fn=worker_init_fn if dl_cfg["num_workers"] > 0 else None,
                                 persistent_workers=dl_cfg["num_workers"] > 0)
 
+        # Optimizer: AdaBelief (DFL default) or Adam
+        optimizer_name = optimizer
+        if optimizer_name == "adabelief":
+            from DeepFaceLab.shared.adabelief import AdaBelief
+            opt_class = AdaBelief
+            _logger.info("Using AdaBelief optimizer")
+        else:
+            opt_class = torch.optim.Adam
+            _logger.info("Using Adam optimizer")
+
         # Create model
         d_mask_dims = d_dims // 3 + (d_dims // 3) % 2
+        effective_gan_patch_size = gan_patch_size if gan_patch_size > 0 else None
         model = SAEHDModel(resolution=resolution, architecture=architecture,
                            ae_dims=ae_dims, e_dims=e_dims, d_dims=d_dims,
                            d_mask_dims=d_mask_dims, gan_dims=gan_dims,
-                           gan_patch_size=gan_patch_size).to(device)
+                           gan_patch_size=effective_gan_patch_size).to(device)
+
+        # CA weights initialization (DFL: after first successful iteration)
+        if ca_weights:
+            model.initialize_ca_weights()
+            _logger.info("Convolution Aware weights initialized")
 
         # Build discriminator if GAN is enabled
         discriminator = None
@@ -295,15 +391,6 @@ class SAEHDTrainer:
             code_discriminator = model.build_code_discriminator(code_res).to(device)
             code_disc_optimizer = opt_class(code_discriminator.parameters(), lr=learning_rate)
             _logger.info(f"True face power enabled: {true_face_power}, code_res={code_res}")
-
-        # Optimizer: AdaBelief (DFL default) or Adam
-        if adabelief:
-            from DeepFaceLab.shared.adabelief import AdaBelief
-            opt_class = AdaBelief
-            _logger.info("Using AdaBelief optimizer")
-        else:
-            opt_class = torch.optim.Adam
-            _logger.info("Using Adam optimizer")
 
         optimizer = opt_class(model.parameters(), lr=learning_rate)
         scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
@@ -349,11 +436,19 @@ class SAEHDTrainer:
             "resolution": resolution, "architecture": architecture,
             "ae_dims": ae_dims, "e_dims": e_dims, "d_dims": d_dims,
             "d_mask_dims": d_mask_dims, "batch_size": batch_size,
-            "learning_rate": learning_rate, "use_amp": use_amp,
+            "learning_rate": learning_rate, "optimizer": optimizer_name,
+            "use_amp": use_amp,
             "random_warp": random_warp, "face_style_power": face_style_power,
             "bg_style_power": bg_style_power, "eyes_mouth_prio": eyes_mouth_prio,
             "masked_training": masked_training, "gan_power": gan_power,
             "lr_dropout": lr_dropout, "lr_cos": lr_cos,
+            "pixel_loss": pixel_loss, "ca_weights": ca_weights,
+            "src_face_scale": src_face_scale, "target_iter": target_iter,
+            "autobackup_hour": autobackup_hour,
+            "write_preview_history": write_preview_history,
+            "random_ct": random_ct, "ct_mode": ct_mode,
+            "random_ct_sample_size": random_ct_sample_size,
+            "learn_mask": learn_mask, "gan_patch_size": gan_patch_size,
         }
         FileManager.atomic_write(model_dir / f"{_MODEL_PREFIX}_training_config.json", json.dumps(config, indent=2))
 
@@ -395,14 +490,22 @@ class SAEHDTrainer:
         blur_sigma = resolution / 128.0
         mask_blur_sigma = max(1, resolution // 32)
 
+        # Preview history directory
+        preview_history_dir = None
+        if write_preview_history:
+            preview_history_dir = model_dir / "preview_history"
+            preview_history_dir.mkdir(parents=True, exist_ok=True)
+
         # Training loop
         lock_path = model_dir / ".training_lock"
         lock_path.write_text(str(time.time()))
 
         last_preview_time = 0.0
         last_save_time = time.time()
+        last_backup_time = time.time()
         iter_count = start_iter
         self._iter_count = iter_count
+        pixel_loss_active = pixel_loss  # DFL: pixel_loss can be toggled during training
 
         src_iter = iter(src_loader)
         dst_iter = iter(dst_loader)
@@ -411,6 +514,11 @@ class SAEHDTrainer:
 
         for _ in itertools.count():
             if self._stop_event.is_set():
+                break
+
+            # target_iter: stop when reached (DFL: 0 = unlimited)
+            if target_iter > 0 and iter_count >= target_iter:
+                _logger.info(f"Target iteration {target_iter} reached, stopping")
                 break
 
             try:
@@ -487,7 +595,8 @@ class SAEHDTrainer:
                 # MSE
                 loss_src = loss_src + 10.0 * ((target_src_opt - pred_src_src_opt) ** 2).mean()
                 # Mask loss
-                loss_src = loss_src + 10.0 * ((src_mask - pred_src_srcm) ** 2).mean()
+                if learn_mask:
+                    loss_src = loss_src + 10.0 * ((src_mask - pred_src_srcm) ** 2).mean()
                 # Eyes/mouth priority (DFL: use dedicated eyes_mouth mask)
                 if eyes_mouth_prio:
                     loss_src = loss_src + 300.0 * ((src_target * src_em_mask - pred_src_src * src_em_mask).abs()).mean()
@@ -499,14 +608,15 @@ class SAEHDTrainer:
                     loss_dst = 5.0 * _dssim(pred_dst_dst_opt, target_dst_opt, filter_size=dssim_filter_size).mean()
                     loss_dst = loss_dst + 5.0 * _dssim(pred_dst_dst_opt, target_dst_opt, filter_size=int(resolution / 23.2)).mean()
                 loss_dst = loss_dst + 10.0 * ((target_dst_opt - pred_dst_dst_opt) ** 2).mean()
-                loss_dst = loss_dst + 10.0 * ((dst_mask - pred_dst_dstm) ** 2).mean()
+                if learn_mask:
+                    loss_dst = loss_dst + 10.0 * ((dst_mask - pred_dst_dstm) ** 2).mean()
                 if eyes_mouth_prio:
                     loss_dst = loss_dst + 300.0 * ((dst_target * dst_em_mask - pred_dst_dst * dst_em_mask).abs()).mean()
 
                 # --- Face style loss (DFL style) ---
                 face_style_power_norm = face_style_power / 100.0
                 if face_style_power_norm != 0:
-                    style_mask = torch.clamp(_gaussian_blur(pred_src_dstm * pred_dst_dstm, mask_blur_sigma), 0, 1.0)
+                    style_mask = torch.clamp(src_mask_blur, 0, 1.0).detach()
                     style_mask = style_mask.detach()
                     loss_src = loss_src + _style_loss(
                         pred_src_dst_no_grad * style_mask,
@@ -530,6 +640,11 @@ class SAEHDTrainer:
                     loss_src = loss_src + (10.0 * bg_style_power_norm) * ((pred_style_anti - target_dst_style_anti) ** 2).mean()
 
                 loss = loss_src + loss_dst
+
+                # --- Pixel loss (DFL: enabled after 20k iters, improves detail) ---
+                if pixel_loss_active and iter_count >= 20000:
+                    loss = loss + 0.5 * F.l1_loss(pred_src_src_opt, target_src_opt)
+                    loss = loss + 0.5 * F.l1_loss(pred_dst_dst_opt, target_dst_opt)
 
                 # --- GAN generator loss (DFL style) ---
                 if gan_power != 0 and discriminator is not None:
@@ -660,10 +775,15 @@ class SAEHDTrainer:
 
             # Preview
             need_preview = (now - last_preview_time) >= preview_interval_sec or self._preview_event.is_set()
-            if on_preview is not None and need_preview:
+            if need_preview:
                 try:
                     preview_img = self._generate_preview(model, device, resolution)
-                    on_preview(preview_img)
+                    if on_preview is not None:
+                        on_preview(preview_img)
+                    # Save preview history to disk (DFL feature)
+                    if preview_history_dir is not None:
+                        preview_path = preview_history_dir / f"preview_{iter_count:08d}.jpg"
+                        cv2.imwrite(str(preview_path), preview_img)
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower():
                         _logger.warning("Preview OOM, skipping")
@@ -673,6 +793,27 @@ class SAEHDTrainer:
                         raise
                 last_preview_time = now
                 self._preview_event.clear()
+
+            # Autobackup (DFL: hourly backup, keeps last 15)
+            if autobackup_hour > 0 and (now - last_backup_time) >= autobackup_hour * 3600:
+                backup_dir = model_dir / "autobackup"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                backup_name = backup_dir / f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                self._save_checkpoint(model, optimizer, iter_count, backup_name,
+                                     lr_dropout_masks=lr_dropout_masks,
+                                     lr_scheduler=lr_scheduler,
+                                     discriminator=discriminator,
+                                     disc_optimizer=disc_optimizer)
+                model.save(backup_name)
+                _logger.info(f"Autobackup saved to {backup_name}")
+                # Keep only last 15 backups
+                backups = sorted(backup_dir.iterdir())
+                while len(backups) > 15:
+                    old = backups.pop(0)
+                    if old.is_dir():
+                        import shutil
+                        shutil.rmtree(old, ignore_errors=True)
+                last_backup_time = now
 
         # Final save
         self._save_checkpoint(model, optimizer, iter_count, model_dir,
@@ -698,27 +839,23 @@ class SAEHDTrainer:
         src_samples = self._sample_images(self._preview_src_paths, n, resolution)
         dst_samples = self._sample_images(self._preview_dst_paths, n, resolution)
 
-        sections = []
+        rows = []
         if src_samples and dst_samples:
-            rows = []
             for i in range(min(len(src_samples), len(dst_samples))):
                 s_bgr, s_img_t = src_samples[i]
                 d_bgr, d_img_t = dst_samples[i]
                 row = self._preview_row(model, device, s_bgr, s_img_t, d_bgr, d_img_t)
                 rows.append(row)
-            if rows:
-                sections.append(("SAEHD", np.vstack(rows)))
 
         model.train()
 
-        if not sections:
+        if not rows:
             return np.zeros((resolution, resolution * 5, 3), dtype=np.uint8)
 
-        idx = 0  # Only one section for now
-        name, preview_bgr = sections[idx]
+        preview_bgr = np.vstack(rows)
         h, w = preview_bgr.shape[:2]
 
-        head = self._draw_head(w, name, 0, 1)
+        head = self._draw_head(w, "SAEHD", 0, 1)
         chart = self._draw_loss_chart(w, 100) if len(self._loss_history) > 2 else np.zeros((100, w, 3), dtype=np.float32)
 
         final = np.vstack([head, chart, preview_bgr])
@@ -727,9 +864,9 @@ class SAEHDTrainer:
     def _preview_row(self, model: SAEHDModel, device: torch.device,
                      s_bgr: np.ndarray, s_img_t: torch.Tensor,
                      d_bgr: np.ndarray, d_img_t: torch.Tensor) -> np.ndarray:
-        """DFL preview: S | SS*mask+S*(1-mask) | D | DD*mask+D*(1-mask) | SD*mask+D*(1-mask)"""
-        S = s_bgr.astype(np.float32) / 255.0  # BGR
-        D = d_bgr.astype(np.float32) / 255.0  # BGR
+        """DFL preview: S | SS | D | DD | SD  (raw model output, no mask compositing)"""
+        S = s_bgr.astype(np.float32) / 255.0
+        D = d_bgr.astype(np.float32) / 255.0
 
         s_t = s_img_t.to(device)
         d_t = d_img_t.to(device)
@@ -737,36 +874,15 @@ class SAEHDTrainer:
         with torch.inference_mode():
             out = model(s_t, d_t)
 
-            # Get all masks (squeeze to 2D, then expand for broadcast)
-            src_mask = out["pred_src_srcm"].squeeze().cpu().numpy()
-            dst_mask = out["pred_dst_dstm"].squeeze().cpu().numpy()
-            swap_mask = out["pred_src_dstm"].squeeze().cpu().numpy()
-            src_mask_3 = src_mask[:, :, np.newaxis]
-            dst_mask_3 = dst_mask[:, :, np.newaxis]
-            sd_mask_3 = np.clip(dst_mask * swap_mask, 0, 1)[:, :, np.newaxis]
-
-            # SS: src self-recon, mask composited with S background
             SS = out["pred_src_src"].squeeze(0).permute(1, 2, 0).cpu().numpy()
-            SS = np.clip(SS, 0, 1)  # RGB
-            S_rgb = S[:, :, ::-1]   # BGR→RGB
-            SS_comp = SS * src_mask_3 + S_rgb * (1.0 - src_mask_3)
-            SS_comp = np.clip(SS_comp, 0, 1)[:, :, ::-1].copy()  # RGB→BGR
-
-            # DD: dst self-recon, mask composited with D background
             DD = out["pred_dst_dst"].squeeze(0).permute(1, 2, 0).cpu().numpy()
-            DD = np.clip(DD, 0, 1)  # RGB
-            D_rgb = D[:, :, ::-1]   # BGR→RGB
-            DD_comp = DD * dst_mask_3 + D_rgb * (1.0 - dst_mask_3)
-            DD_comp = np.clip(DD_comp, 0, 1)[:, :, ::-1].copy()  # RGB→BGR
-
-            # SD: swap, mask composited with D background
             SD = out["pred_src_dst"].squeeze(0).permute(1, 2, 0).cpu().numpy()
-            SD = np.clip(SD, 0, 1)  # RGB
-            SD_comp = SD * sd_mask_3 + D_rgb * (1.0 - sd_mask_3)
-            SD_comp = np.clip(SD_comp, 0, 1)[:, :, ::-1].copy()  # RGB→BGR
 
-        row = np.concatenate([S, SS_comp, D, DD_comp, SD_comp], axis=1)
-        return np.clip(row, 0, 1)
+        S_rgb = S[:, :, ::-1]
+        D_rgb = D[:, :, ::-1]
+
+        row = np.concatenate([S_rgb, SS, D_rgb, DD, SD], axis=1)
+        return np.clip(row, 0, 1)[:, :, ::-1].copy()
 
     def _sample_images(self, paths: list[Path], n: int, resolution: int) -> list[tuple[np.ndarray, torch.Tensor]]:
         if not paths:
@@ -784,7 +900,6 @@ class SAEHDTrainer:
                 continue
             resized = cv2.resize(img, (resolution, resolution))
             img_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            # [0,1] range for SAEHD
             img_t = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
             entry = (resized, img_t)
             self._preview_cache[cache_key] = entry
