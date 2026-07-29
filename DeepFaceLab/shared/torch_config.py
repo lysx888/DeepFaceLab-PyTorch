@@ -42,12 +42,15 @@ def configure_torch(mode: str = "gpu_train") -> dict:
 
 
 def get_dataloader_config(mode: str = "gpu_train", dataset_size: int = 0) -> dict:
+    # Keep num_workers low: PyTorch Windows spawn copies full Dataset per worker.
+    # DFL uses shared memory (MPSharedList); PyTorch has no equivalent.
+    # num_workers=0 means main-thread loading (lowest memory, acceptable speed with SSD).
     if dataset_size < 100:
         num_workers = 0
-    elif dataset_size < 500:
+    elif dataset_size < 1000:
         num_workers = 2
     else:
-        num_workers = min(4, _physical_cores)
+        num_workers = min(2, _physical_cores)
     return {
         "num_workers": num_workers,
         "pin_memory": True,
