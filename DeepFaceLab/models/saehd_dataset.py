@@ -82,6 +82,67 @@ def _color_transfer_mkl(src: np.ndarray, dst_sample: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(result, cv2.COLOR_LAB2BGR)
 
 
+def _color_transfer_lct(src: np.ndarray, dst_sample: np.ndarray) -> np.ndarray:
+    """Linear Color Transfer: full covariance matching (DFL lct mode)."""
+    src_lab = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float64)
+    dst_lab = cv2.cvtColor(dst_sample, cv2.COLOR_BGR2LAB).astype(np.float64)
+    src_flat = src_lab.reshape(-1, 3)
+    dst_flat = dst_lab.reshape(-1, 3)
+    src_mean, dst_mean = src_flat.mean(0), dst_flat.mean(0)
+    src_cov = np.cov(src_flat, rowvar=False)
+    dst_cov = np.cov(dst_flat, rowvar=False)
+    src_std = np.linalg.cholesky(src_cov + 1e-6 * np.eye(3))
+    dst_std = np.linalg.cholesky(dst_cov + 1e-6 * np.eye(3))
+    T = dst_std @ np.linalg.inv(src_std)
+    result = ((src_flat - src_mean) @ T.T) + dst_mean
+    return cv2.cvtColor(np.clip(result.reshape(src_lab.shape), 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def _color_transfer_idt(src: np.ndarray, dst_sample: np.ndarray) -> np.ndarray:
+    """Iterative Distribution Transfer (DFL idt mode): histogram matching per channel."""
+    result = np.empty_like(src)
+    for c in range(3):
+        src_ch = src[:, :, c]
+        dst_ch = dst_sample[:, :, c]
+        # Histogram matching
+        src_hist, _ = np.histogram(src_ch.flatten(), 256, [0, 256])
+        dst_hist, _ = np.histogram(dst_ch.flatten(), 256, [0, 256])
+        src_cdf = src_hist.cumsum().astype(np.float64)
+        dst_cdf = dst_hist.cumsum().astype(np.float64)
+        src_cdf = src_cdf / src_cdf[-1]
+        dst_cdf = dst_cdf / dst_cdf[-1]
+        # Map src values to dst distribution
+        lookup = np.zeros(256, dtype=np.uint8)
+        for i in range(256):
+            j = np.searchsorted(dst_cdf, src_cdf[i])
+            lookup[i] = min(j, 255)
+        result[:, :, c] = lookup[src_ch]
+    return result
+
+
+def _color_transfer_sot(src: np.ndarray, dst_sample: np.ndarray) -> np.ndarray:
+    """Sliced Optimal Transfer (DFL sot-m mode): 1D optimal transport per random projection."""
+    src_lab = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float64)
+    dst_lab = cv2.cvtColor(dst_sample, cv2.COLOR_BGR2LAB).astype(np.float64)
+    src_flat = src_lab.reshape(-1, 3)
+    dst_flat = dst_lab.reshape(-1, 3)
+    n_proj = 10
+    result_flat = src_flat.copy()
+    for _ in range(n_proj):
+        direction = np.random.randn(3)
+        direction /= np.linalg.norm(direction)
+        src_proj = src_flat @ direction
+        dst_proj = dst_flat @ direction
+        src_order = np.argsort(src_proj)
+        dst_order = np.argsort(dst_proj)
+        # Map sorted src to sorted dst
+        n_src, n_dst = len(src_proj), len(dst_proj)
+        indices = np.interp(np.arange(n_src), np.linspace(0, n_dst - 1, n_dst), np.arange(n_dst)).astype(int)
+        shift = dst_proj[dst_order[indices[src_order]]] - src_proj
+        result_flat += shift[:, None] * direction[None, :]
+    return cv2.cvtColor(np.clip(result_flat.reshape(src_lab.shape), 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
 def _render_face_mask(res: int, meta: FaceMetadata) -> np.ndarray:
     """Render full-face mask at training resolution from landmarks (DFL: on-the-fly)."""
     mask = np.zeros((res, res), dtype=np.uint8)
@@ -177,9 +238,11 @@ class SAEHDDataset(Dataset):
         random_warp: bool = True,
         random_flip: bool = True,
         random_hsv_power: float = 0.0,
-        color_transfer: str = "none",
+        random_ct: bool = False,
+        ct_mode: str = "none",
         ct_sample_pool: Optional[list] = None,
         uniform_yaw: bool = False,
+        src_face_scale: int = 0,
     ) -> None:
         self._aligned_dir = Path(aligned_dir)
         self._resolution = resolution
@@ -188,9 +251,11 @@ class SAEHDDataset(Dataset):
         self._random_warp = random_warp
         self._random_flip = random_flip
         self._random_hsv_power = random_hsv_power
-        self._color_transfer = color_transfer
+        self._random_ct = random_ct
+        self._ct_mode = ct_mode
         self._ct_sample_pool = ct_sample_pool or []
         self._uniform_yaw = uniform_yaw
+        self._src_face_scale = src_face_scale
 
         # Only store paths + lightweight metadata — NO pixel data cached
         self._image_paths: list[Path] = FileManager.find_images(self._aligned_dir)
@@ -270,24 +335,43 @@ class SAEHDDataset(Dataset):
             warped_img = cv2.warpAffine(warped_img, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
             warped_mask = cv2.warpAffine(warped_mask, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
 
-            # Nonlinear warp ONLY on warped (DFL key difference)
-            if self._random_warp and self._is_src:
+            # Nonlinear warp ONLY on warped (DFL: both src and dst)
+            if self._random_warp:
                 warped_img, warped_mask = _random_warp_nonlinear(warped_img, warped_mask)
 
             # HSV only on warped
-            if self._is_src and self._random_hsv_power > 0:
+            if self._random_hsv_power > 0:
                 warped_img = _random_hsv_dfl(warped_img, self._random_hsv_power)
 
+            # src_face_scale: scale src face region (DFL: -30..30% modifier)
+            if self._src_face_scale != 0 and self._is_src:
+                scale_factor = 1.0 + self._src_face_scale / 100.0
+                cx, cy = w // 2, h // 2
+                new_w, new_h = int(w * scale_factor), int(h * scale_factor)
+                scaled = cv2.resize(warped_img, (new_w, new_h))
+                # Center crop/pad back to original size
+                if new_w > w:
+                    sx = (new_w - w) // 2
+                    sy = (new_h - h) // 2
+                    warped_img = scaled[sy:sy+h, sx:sx+w]
+                else:
+                    sx = (w - new_w) // 2
+                    sy = (h - new_h) // 2
+                    warped_img = np.zeros_like(warped_img)
+                    warped_img[sy:sy+new_h, sx:sx+new_w] = scaled
+
             # Color transfer on both (DFL: ct applies to warped and target)
-            if self._color_transfer != "none" and self._is_src and self._ct_sample_pool:
+            if self._random_ct and self._ct_mode != "none" and self._is_src and self._ct_sample_pool:
                 ct_sample = random.choice(self._ct_sample_pool)
                 ct_resized = cv2.resize(ct_sample, (res, res))
-                if self._color_transfer == "rct":
-                    target_img = _color_transfer_rct(target_img, ct_resized)
-                    warped_img = _color_transfer_rct(warped_img, ct_resized)
-                elif self._color_transfer == "mkl":
-                    target_img = _color_transfer_mkl(target_img, ct_resized)
-                    warped_img = _color_transfer_mkl(warped_img, ct_resized)
+                ct_func = {
+                    "rct": _color_transfer_rct, "mkl": _color_transfer_mkl,
+                    "lct": _color_transfer_lct, "idt": _color_transfer_idt,
+                    "sot-m": _color_transfer_sot, "sot": _color_transfer_sot,
+                }.get(self._ct_mode)
+                if ct_func is not None:
+                    target_img = ct_func(target_img, ct_resized)
+                    warped_img = ct_func(warped_img, ct_resized)
 
         warped_rgb = cv2.cvtColor(warped_img, cv2.COLOR_BGR2RGB)
         target_rgb = cv2.cvtColor(target_img, cv2.COLOR_BGR2RGB)

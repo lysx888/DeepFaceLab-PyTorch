@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +14,43 @@ from DeepFaceLab.shared.file_manager import FileManager
 from DeepFaceLab.shared.logger import get_logger
 
 _logger = get_logger("saehd_model")
+
+
+# ---------------------------------------------------------------------------
+# Convolution Aware (CA) weight initialization (DFL feature)
+# ---------------------------------------------------------------------------
+
+def _ca_init_weights(module: nn.Module) -> None:
+    """Initialize Conv2d weights using Convolution Aware initialization.
+    
+    Based on 'Convolutional Filters That Are Trained in the Frequency Domain'
+    Uses Gabor-like filters for initial weights instead of random init.
+    """
+    for m in module.modules():
+        if isinstance(m, nn.Conv2d):
+            kernel_size = m.kernel_size[0]
+            out_ch, in_ch = m.out_channels, m.in_channels
+            # Gabor-like initialization
+            weights = np.zeros((out_ch, in_ch, kernel_size, kernel_size), dtype=np.float32)
+            for o in range(out_ch):
+                for i in range(in_ch):
+                    # Random frequency and orientation
+                    freq = np.random.uniform(0.1, 0.5)
+                    theta = np.random.uniform(0, np.pi)
+                    sigma = np.random.uniform(1.0, kernel_size / 3.0)
+                    for y in range(kernel_size):
+                        for x in range(kernel_size):
+                            x_rot = (x - kernel_size // 2) * np.cos(theta) + (y - kernel_size // 2) * np.sin(theta)
+                            y_rot = -(x - kernel_size // 2) * np.sin(theta) + (y - kernel_size // 2) * np.cos(theta)
+                            gabor = np.exp(-0.5 * (x_rot**2 + y_rot**2) / sigma**2) * np.cos(2 * np.pi * freq * x_rot)
+                            weights[o, i, y, x] = gabor
+            # Normalize
+            std = weights.std()
+            if std > 0:
+                weights = weights / std * 0.1
+            m.weight.data = torch.from_numpy(weights).to(m.weight.device)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
 
 
 # ---------------------------------------------------------------------------
@@ -386,12 +424,13 @@ class SAEHDModel(nn.Module):
         self.e_dims = e_dims
         self.d_dims = d_dims
         self.d_mask_dims = d_mask_dims if d_mask_dims is not None else (d_dims // 3 + d_dims // 3 % 2)
-        self.use_liae = (architecture == "liae")
         archi_parts = architecture.split("-")
         self.archi_type = archi_parts[0]  # df or liae
         self.archi_opts = archi_parts[1] if len(archi_parts) > 1 else ""  # u/d/t/c
+        self.use_liae = (self.archi_type == "liae")
         self.use_depth_to_space = "d" in self.archi_opts
         self.use_pixel_norm = "u" in self.archi_opts
+        self.use_true_face = "t" in self.archi_opts  # -t: make face more like src (DFL 2021-10)
 
         # Calculate downscale steps: res → res/2 → ... → res/16
         n_downscales = 0
@@ -413,7 +452,8 @@ class SAEHDModel(nn.Module):
             in_ch=3, e_dims=e_dims, n_downscales=enc_downscales,
             use_pixel_norm=self.use_pixel_norm or self.use_liae,
         )
-        enc_out_features = self.encoder.out_ch * (bottleneck_res ** 2)
+        enc_spatial_res = resolution // (2 ** enc_downscales)
+        enc_out_features = self.encoder.out_ch * (enc_spatial_res ** 2)
 
         if not self.use_liae:
             # df architecture: shared inter + separate decoders
@@ -447,12 +487,52 @@ class SAEHDModel(nn.Module):
             self.decoder = SAEHDDecoder(shared_dec_in_ch, d_dims, self.d_mask_dims,
                                         use_depth_to_space=self.use_depth_to_space)
 
+        # -t variant: learnable src identity injection (DFL 2021-10)
+        if self.use_true_face:
+            if not self.use_liae:
+                # df: inject into inter output before decoder_src
+                bottleneck_ch = ae_dims
+                self.src_identity = nn.Parameter(torch.zeros(1, bottleneck_ch,
+                    bottleneck_res * 2 if self.use_depth_to_space else bottleneck_res,
+                    bottleneck_res * 2 if self.use_depth_to_space else bottleneck_res))
+            else:
+                # liae: inject into shared decoder input
+                self.src_identity = nn.Parameter(torch.zeros(1, ae_dims * 2 * 2,
+                    bottleneck_res * 2 if self.use_depth_to_space else bottleneck_res,
+                    bottleneck_res * 2 if self.use_depth_to_space else bottleneck_res))
+
         self.gan_dims = gan_dims
         self.gan_patch_size = gan_patch_size if gan_patch_size is not None else max(8, resolution // 8)
         self.discriminator = None
         self.code_discriminator = None
 
+        # DFL uses Glorot (Xavier) uniform for bottleneck Dense layers only.
+        # Conv layers before LeakyReLU use PyTorch default (Kaiming uniform)
+        # which is the correct init for ReLU-family activations.
+        self._init_bottleneck_weights()
+
     # ---- Forward methods for training ----
+
+    def _init_bottleneck_weights(self):
+        """Initialize bottleneck Dense layers with Xavier uniform (DFL behavior).
+        
+        Only the SAEHDInter dense layers use Glorot/Xavier uniform, matching
+        how DFL's tf.keras.layers.Dense defaults work. All Conv2d layers keep
+        PyTorch's Kaiming uniform default (correct for LeakyReLU).
+        """
+        inter_modules = []
+        if hasattr(self, 'inter'):
+            inter_modules.append(self.inter)
+        if hasattr(self, 'inter_AB'):
+            inter_modules.append(self.inter_AB)
+        if hasattr(self, 'inter_B'):
+            inter_modules.append(self.inter_B)
+        for inter in inter_modules:
+            for m in inter.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     def encode(self, img: torch.Tensor) -> torch.Tensor:
         """Encode image to bottleneck code."""
@@ -496,6 +576,11 @@ class SAEHDModel(nn.Module):
         else:
             raise RuntimeError("Use decode_liae() for liae architecture")
 
+    def initialize_ca_weights(self) -> None:
+        """Apply Convolution Aware weight initialization (DFL feature)."""
+        _ca_init_weights(self)
+        _logger.info("CA weights initialized")
+
     def forward_df(self, src_img: torch.Tensor, dst_img: torch.Tensor) -> dict:
         """
         Full forward pass for df architecture.
@@ -507,15 +592,27 @@ class SAEHDModel(nn.Module):
         src_inter = self.inter(src_code)
         dst_inter = self.inter(dst_code)
 
+        # -t variant: inject learnable src identity into src decoder path
+        if self.use_true_face:
+            src_inter_for_src = src_inter + self.src_identity
+        else:
+            src_inter_for_src = src_inter
+
         # Self-reconstruction
-        pred_src_src, pred_src_srcm = self.decoder_src(src_inter)
+        pred_src_src, pred_src_srcm = self.decoder_src(src_inter_for_src)
         pred_dst_dst, pred_dst_dstm = self.decoder_dst(dst_inter)
 
-        # Swap: decoder_src with dst's code
-        pred_src_dst, pred_src_dstm = self.decoder_src(dst_inter)
+        # Swap: decoder_src with dst's code (also with identity for -t)
+        if self.use_true_face:
+            dst_inter_for_src = dst_inter + self.src_identity
+        else:
+            dst_inter_for_src = dst_inter
+        pred_src_dst, pred_src_dstm = self.decoder_src(dst_inter_for_src)
 
         # Swap with stop_gradient on code (for style loss)
         dst_inter_detached = dst_inter.detach()
+        if self.use_true_face:
+            dst_inter_detached = dst_inter_detached + self.src_identity
         pred_src_dst_no_grad, _ = self.decoder_src(dst_inter_detached)
 
         return {
@@ -545,6 +642,11 @@ class SAEHDModel(nn.Module):
         dst_code = torch.cat([dst_inter_B, dst_inter_AB], dim=1)
         # swap code = concat(inter_AB(dst), inter_AB(dst)) — no dst identity
         swap_code = torch.cat([dst_inter_AB, dst_inter_AB], dim=1)
+
+        # -t variant: inject learnable src identity into src decoder path
+        if self.use_true_face:
+            src_code = src_code + self.src_identity
+            swap_code = swap_code + self.src_identity
 
         # Self-reconstruction
         pred_src_src, pred_src_srcm = self.decoder(src_code)
@@ -584,13 +686,21 @@ class SAEHDModel(nn.Module):
             if not self.use_liae:
                 dst_code = self.encoder(dst_img)
                 dst_inter = self.inter(dst_code)
-                swapped, swap_mask = self.decoder_src(dst_inter)
+                # -t variant: inject src_identity for swap
+                if self.use_true_face:
+                    swap_inter = dst_inter + self.src_identity
+                else:
+                    swap_inter = dst_inter
+                swapped, swap_mask = self.decoder_src(swap_inter)
                 _, dst_mask = self.decoder_dst(dst_inter)
             else:
                 dst_enc = self.encoder(dst_img)
                 dst_inter_AB = self.inter_AB(dst_enc)
                 dst_inter_B = self.inter_B(dst_enc)
                 swap_code = torch.cat([dst_inter_AB, dst_inter_AB], dim=1)
+                # -t variant: inject src_identity for swap
+                if self.use_true_face:
+                    swap_code = swap_code + self.src_identity
                 dst_code = torch.cat([dst_inter_B, dst_inter_AB], dim=1)
                 swapped, swap_mask = self.decoder(swap_code)
                 _, dst_mask = self.decoder(dst_code)
@@ -629,6 +739,12 @@ class SAEHDModel(nn.Module):
             buf = io.BytesIO()
             torch.save(module.state_dict(), buf)
             FileManager.atomic_write(model_dir / f"SAEHD_{name}.pt", buf.getvalue())
+
+        # Save src_identity for -t variant
+        if self.use_true_face and hasattr(self, 'src_identity'):
+            buf = io.BytesIO()
+            torch.save(self.src_identity.data, buf)
+            FileManager.atomic_write(model_dir / "SAEHD_src_identity.pt", buf.getvalue())
 
         if self.discriminator is not None:
             buf = io.BytesIO()
@@ -683,6 +799,14 @@ class SAEHDModel(nn.Module):
                 self.code_discriminator.load_state_dict(torch.load(io.BytesIO(data), map_location=map_loc, weights_only=True))
 
         _logger.info(f"SAEHD model loaded from {model_dir}")
+
+        # Load src_identity for -t variant
+        identity_path = model_dir / "SAEHD_src_identity.pt"
+        if identity_path.exists() and self.use_true_face and hasattr(self, 'src_identity'):
+            data = open(str(identity_path), "rb").read()
+            self.src_identity.data = torch.load(io.BytesIO(data), map_location=map_loc, weights_only=True)
+            _logger.info("src_identity loaded")
+
         return True
 
     @classmethod
@@ -690,7 +814,7 @@ class SAEHDModel(nn.Module):
         return cls(
             resolution=config.get("resolution", 128),
             architecture=config.get("architecture", "df"),
-            ae_dims=config.get("ae_dims", 256),
+            ae_dims=config.get("ae_dims", 512),
             e_dims=config.get("e_dims", 64),
             d_dims=config.get("d_dims", 64),
             d_mask_dims=config.get("d_mask_dims", None),
