@@ -144,7 +144,16 @@ def _color_transfer_sot(src: np.ndarray, dst_sample: np.ndarray) -> np.ndarray:
 
 
 def _render_face_mask(res: int, meta: FaceMetadata) -> np.ndarray:
-    """Render full-face mask at training resolution from landmarks (DFL: on-the-fly)."""
+    """Render full-face mask at training resolution from landmarks (DFL: multi-part hull).
+
+    InsightFace 106-point indices (NOT dlib 68):
+      Jaw/cheek: 0-32 (right jaw 0-8, left jaw 9-16, right cheek 17-24, left cheek 25-32)
+      Right eye: 33-42, right eyeball: 34,38
+      Left eye: 87-96, left eyeball: 88,92
+      Nose bridge: 72-74,86  Nose bottom: 75-85
+      Outer lip: 52-71  Inner lip: 54-70
+      Right eyebrow: 43-51  Left eyebrow: 97-105
+    """
     mask = np.zeros((res, res), dtype=np.uint8)
     if meta.landmarks_106 is None:
         return np.ones((res, res), dtype=np.uint8) * 255
@@ -153,8 +162,32 @@ def _render_face_mask(res: int, meta: FaceMetadata) -> np.ndarray:
     scale_y = res / meta.output_size if meta.output_size != res else 1.0
     lm[:, 0] *= scale_x
     lm[:, 1] *= scale_y
-    hull = cv2.convexHull(lm.astype(np.float32))
-    cv2.fillPoly(mask, [hull.astype(np.int64)], 255)
+
+    r_jaw = lm[0:9]
+    l_jaw = lm[9:17]
+    r_cheek = lm[17:25]
+    l_cheek = lm[25:33]
+    r_eye = lm[33:43]
+    l_eye = lm[87:97]
+    nose_bridge = lm[[72, 73, 74, 86]]
+    nose_bottom = lm[75:86]
+    r_brow = lm[43:52]
+    l_brow = lm[97:106]
+
+    chin = lm[8:9]
+    parts = [
+        np.concatenate([r_jaw, r_brow]),
+        np.concatenate([l_jaw, l_brow]),
+        np.concatenate([r_cheek, chin]),
+        np.concatenate([l_cheek, chin]),
+        np.concatenate([nose_bridge, chin]),
+        np.concatenate([r_eye, nose_bottom, chin]),
+        np.concatenate([l_eye, nose_bottom, chin]),
+        np.concatenate([nose_bridge, nose_bottom]),
+    ]
+    for part in parts:
+        hull = cv2.convexHull(part.astype(np.float32))
+        cv2.fillConvexPoly(mask, hull.astype(np.int64), 255)
     return mask
 
 
@@ -182,7 +215,12 @@ def _render_mask_from_polys(res: int, meta: FaceMetadata) -> np.ndarray:
 
 
 def _render_eyes_mouth_mask(res: int, meta: FaceMetadata) -> np.ndarray:
-    """Render eyes+mouth priority mask at training resolution (DFL: on-the-fly)."""
+    """Render eyes+mouth priority mask at training resolution (DFL: on-the-fly).
+
+    InsightFace 106-point indices:
+      Right eye: 33-42, Left eye: 87-96
+      Outer lip: 52-71, Inner lip: 54-70
+    """
     mask = np.zeros((res, res), dtype=np.uint8)
     if meta.landmarks_106 is None:
         return mask
@@ -191,13 +229,14 @@ def _render_eyes_mouth_mask(res: int, meta: FaceMetadata) -> np.ndarray:
     scale_y = res / meta.output_size if meta.output_size != res else 1.0
     lm[:, 0] *= scale_x
     lm[:, 1] *= scale_y
-    left_eye = lm[63:73].astype(np.int64)
-    right_eye = lm[73:83].astype(np.int64)
-    upper_lip = lm[83:93].astype(np.int64)
-    lower_lip = lm[93:103].astype(np.int64)
-    inner_lip = lm[103:106].astype(np.int64)
-    mouth_pts = np.vstack([upper_lip, lower_lip, inner_lip])
-    for pts in [left_eye, right_eye]:
+
+    r_eye = lm[33:43].astype(np.int64)
+    l_eye = lm[87:97].astype(np.int64)
+    outer_lip = lm[52:72].astype(np.int64)
+    inner_lip = lm[54:71].astype(np.int64)
+    mouth_pts = np.vstack([outer_lip, inner_lip])
+
+    for pts in [r_eye, l_eye]:
         hull = cv2.convexHull(pts)
         cv2.fillPoly(mask, [hull], 255)
     mouth_hull = cv2.convexHull(mouth_pts)
@@ -373,11 +412,8 @@ class SAEHDDataset(Dataset):
                     target_img = ct_func(target_img, ct_resized)
                     warped_img = ct_func(warped_img, ct_resized)
 
-        warped_rgb = cv2.cvtColor(warped_img, cv2.COLOR_BGR2RGB)
-        target_rgb = cv2.cvtColor(target_img, cv2.COLOR_BGR2RGB)
-
-        warped_tensor = torch.from_numpy(warped_rgb.astype(np.float32) / 255.0).permute(2, 0, 1)
-        target_tensor = torch.from_numpy(target_rgb.astype(np.float32) / 255.0).permute(2, 0, 1)
+        warped_tensor = torch.from_numpy(warped_img.astype(np.float32) / 255.0).permute(2, 0, 1)
+        target_tensor = torch.from_numpy(target_img.astype(np.float32) / 255.0).permute(2, 0, 1)
         mask_tensor = torch.from_numpy(target_mask.astype(np.float32) / 255.0).unsqueeze(0)
         em_mask_tensor = torch.from_numpy(target_em_mask.astype(np.float32) / 255.0).unsqueeze(0)
 

@@ -6,6 +6,82 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class XCosX(nn.Module):
+    """x * cos(x) activation function (DFL 'c' architecture option).
+
+    Smooth, bounded, oscillating — provides implicit regularization.
+    Derivative: cos(x) - x*sin(x), well-defined everywhere.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.cos(x)
+
+
+def _get_activation(use_c: bool = False) -> nn.Module:
+    if use_c:
+        return XCosX()
+    return nn.LeakyReLU(0.1, inplace=True)
+
+
+class VGGPerceptualLoss(nn.Module):
+    """VGG16-based perceptual loss (LPIPS-style).
+
+    Extracts features from conv1_2, conv2_2, conv3_3, conv4_3 layers
+    and computes L1 distance in feature space.
+
+    Input: BGR images in [0, 1] range (will be converted to RGB internally).
+    """
+
+    _VGG_MEAN = torch.tensor([0.485, 0.456, 0.406])
+    _VGG_STD = torch.tensor([0.229, 0.224, 0.225])
+
+    def __init__(self, device: torch.device = None):
+        super().__init__()
+        try:
+            from torchvision.models import vgg16, VGG16_Weights
+            vgg = vgg16(weights=VGG16_Weights.DEFAULT)
+        except (ImportError, OSError):
+            from torchvision.models import vgg16
+            vgg = vgg16(pretrained=True)
+
+        self._feature_layers = [3, 8, 15, 22]
+        self._vgg_blocks = nn.ModuleList()
+        prev_idx = 0
+        for layer_idx in self._feature_layers:
+            block = nn.Sequential(*list(vgg.features.children())[prev_idx:layer_idx + 1])
+            self._vgg_blocks.append(block)
+            prev_idx = layer_idx + 1
+
+        for param in self.parameters():
+            param.requires_grad = False
+        self.eval()
+
+        if device is not None:
+            self.to(device)
+        self._mean: torch.Tensor = None
+        self._std: torch.Tensor = None
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        # BGR -> RGB
+        x = x[:, [2, 1, 0], :, :]
+        if self._mean is None or self._mean.device != x.device:
+            self._mean = self._VGG_MEAN.to(x.device).view(1, 3, 1, 1)
+            self._std = self._VGG_STD.to(x.device).view(1, 3, 1, 1)
+        return (x - self._mean) / self._std
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_n = self._normalize(pred)
+        target_n = self._normalize(target)
+        loss = torch.tensor(0.0, device=pred.device)
+        x_pred = pred_n
+        x_target = target_n
+        for block in self._vgg_blocks:
+            x_pred = block(x_pred)
+            x_target = block(x_target)
+            loss = loss + F.l1_loss(x_pred, x_target)
+        return loss
+
+
 def ca_init_weights(module: nn.Module) -> None:
     """Initialize Conv2d weights using Convolution Aware initialization.
 
@@ -37,12 +113,12 @@ def ca_init_weights(module: nn.Module) -> None:
 
 
 class Downscale(nn.Module):
-    """Conv2D(kernel=5, stride=2) + LeakyReLU(0.1)"""
+    """Conv2D(kernel=5, stride=2) + activation"""
 
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 5):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 5, use_c: bool = False):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size, stride=2, padding=kernel_size // 2)
-        self.act = nn.LeakyReLU(0.1, inplace=True)
+        self.act = _get_activation(use_c)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.conv(x))
@@ -51,13 +127,13 @@ class Downscale(nn.Module):
 class DownscaleBlock(nn.Module):
     """N downscale steps. Channel progression: ch*min(2^i, 8) for i=0..N-1"""
 
-    def __init__(self, in_ch: int, ch: int, n_downscales: int = 4, kernel_size: int = 5):
+    def __init__(self, in_ch: int, ch: int, n_downscales: int = 4, kernel_size: int = 5, use_c: bool = False):
         super().__init__()
         self.downs = nn.ModuleList()
         last_ch = in_ch
         for i in range(n_downscales):
             cur_ch = ch * min(2 ** i, 8)
-            self.downs.append(Downscale(last_ch, cur_ch, kernel_size=kernel_size))
+            self.downs.append(Downscale(last_ch, cur_ch, kernel_size=kernel_size, use_c=use_c))
             last_ch = cur_ch
         self.out_ch = last_ch
 
@@ -68,12 +144,12 @@ class DownscaleBlock(nn.Module):
 
 
 class Upscale(nn.Module):
-    """Conv2D(in, out*4, k=3) + LeakyReLU(0.1) + PixelShuffle(2) = 2x upsample"""
+    """Conv2D(in, out*4, k=3) + activation + PixelShuffle(2) = 2x upsample"""
 
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, use_c: bool = False):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch * 4, kernel_size, padding=kernel_size // 2)
-        self.act = nn.LeakyReLU(0.1, inplace=True)
+        self.act = _get_activation(use_c)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.act(self.conv(x))
@@ -84,19 +160,26 @@ class Upscale(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    """Conv -> LeakyReLU(0.2) -> Conv -> add input -> LeakyReLU(0.2)"""
+    """Conv -> act(0.2) -> Conv -> add input -> act(0.2)"""
 
-    def __init__(self, ch: int, kernel_size: int = 3):
+    def __init__(self, ch: int, kernel_size: int = 3, use_c: bool = False):
         super().__init__()
         self.conv1 = nn.Conv2d(ch, ch, kernel_size, padding=kernel_size // 2)
         self.conv2 = nn.Conv2d(ch, ch, kernel_size, padding=kernel_size // 2)
+        self.use_c = use_c
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         res = self.conv1(x)
-        res = F.leaky_relu(res, 0.2)
+        if self.use_c:
+            res = res * torch.cos(res)
+        else:
+            res = F.leaky_relu(res, 0.2)
         res = self.conv2(res)
         out = x + res
-        out = F.leaky_relu(out, 0.2)
+        if self.use_c:
+            out = out * torch.cos(out)
+        else:
+            out = F.leaky_relu(out, 0.2)
         return out
 
 
@@ -152,7 +235,7 @@ class UNetPatchDiscriminator(nn.Module):
 
         self.decoder_convs = nn.ModuleList()
         for i in range(n_layers):
-            ch_in = level_chs[i + 1] * 2
+            ch_in = level_chs[i] * 2
             ch_out = level_chs[i + 1]
             self.decoder_convs.append(nn.ConvTranspose2d(
                 ch_in, ch_out, kernel_size=3, stride=strides[n_layers - 1 - i],
