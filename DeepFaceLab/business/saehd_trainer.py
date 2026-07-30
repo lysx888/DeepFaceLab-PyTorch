@@ -31,7 +31,8 @@ from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, RandomSampler
 
 from DeepFaceLab.models.saehd_model import SAEHDModel
-from DeepFaceLab.models.saehd_dataset import SAEHDDataset
+from DeepFaceLab.models.saehd_dataset import SAEHDDataset, _generate_masks
+from DeepFaceLab.core.metadata_manager import MetadataManager
 from DeepFaceLab.shared.file_manager import FileManager
 from DeepFaceLab.shared.logger import get_logger
 from DeepFaceLab.shared.torch_config import get_dataloader_config, get_non_blocking, worker_init_fn
@@ -59,6 +60,14 @@ class _DFLCosineScheduler:
     @property
     def current_factor(self) -> float:
         return (math.cos(self._step_count * 2.0 * math.pi / self._lr_cos) + 1.0) / 2.0
+
+    @property
+    def lr_cos(self) -> int:
+        return self._lr_cos
+
+    @lr_cos.setter
+    def lr_cos(self, value: int) -> None:
+        self._lr_cos = value
 
 _logger = get_logger("saehd_trainer")
 
@@ -212,6 +221,8 @@ class SAEHDTrainer:
         self._model_dir = None
         self._preview_src_paths: list[Path] = []
         self._preview_dst_paths: list[Path] = []
+        self._preview_src_meta: dict = {}
+        self._preview_dst_meta: dict = {}
         self._preview_n = 3
         self._preview_resolution = 128
         self._preview_cache: dict = {}
@@ -271,6 +282,7 @@ class SAEHDTrainer:
         src_face_scale: int = 0,
         pixel_loss: bool = False,
         ca_weights: bool = False,
+        perceptual_power: float = 0.0,
         target_iter: int = 0,
         autobackup_hour: int = 0,
         write_preview_history: bool = False,
@@ -390,7 +402,7 @@ class SAEHDTrainer:
         disc_optimizer = None
         if gan_power != 0:
             discriminator = model.build_discriminator().to(device)
-            disc_optimizer = opt_class(discriminator.parameters(), lr=learning_rate)
+            disc_optimizer = opt_class(discriminator.parameters(), lr=learning_rate, weight_decay=1e-5)
             _logger.info(f"GAN enabled: power={gan_power}, dims={gan_dims}, patch_size={model.gan_patch_size}")
 
         # Build CodeDiscriminator if true_face_power enabled (df architecture only)
@@ -399,11 +411,24 @@ class SAEHDTrainer:
         if true_face_power != 0 and not model.use_liae:
             code_res = model.inter.get_out_res()
             code_discriminator = model.build_code_discriminator(code_res).to(device)
-            code_disc_optimizer = opt_class(code_discriminator.parameters(), lr=learning_rate)
+            code_disc_optimizer = opt_class(code_discriminator.parameters(), lr=learning_rate, weight_decay=1e-5)
             _logger.info(f"True face power enabled: {true_face_power}, code_res={code_res}")
 
-        optimizer = opt_class(model.parameters(), lr=learning_rate)
-        scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
+        optimizer = opt_class(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+
+        # VGG perceptual loss (optional, improves texture detail over pure MSE)
+        vgg_perceptual = None
+        if perceptual_power > 0:
+            from DeepFaceLab.models.building_blocks import VGGPerceptualLoss
+            vgg_perceptual = VGGPerceptualLoss(device=device)
+            _logger.info(f"VGG perceptual loss enabled (power={perceptual_power})")
+
+        use_bf16 = use_amp and device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 8
+        if use_bf16:
+            _logger.info("Using BF16 mixed precision (no GradScaler needed)")
+        elif use_amp and device.type == "cuda":
+            _logger.info("GPU does not support BF16, falling back to FP32")
+        scaler = None
 
         # Pretrain + LIAE: freeze inter_AB (DFL design: inter_AB learns cross-identity mapping)
         frozen_params: set[str] = set()
@@ -415,9 +440,10 @@ class SAEHDTrainer:
             _logger.info(f"Pretrain LIAE: inter_AB frozen ({len(frozen_params)} params)")
 
         # LR Dropout: generate fixed Bernoulli masks (DFL-style, once at init)
-        lr_dropout_masks: dict[str, torch.Tensor] = {}
-        lr_dropout_p = 0.3 if lr_dropout in ("y", "cpu") else 1.0
-        if lr_dropout_p < 1.0:
+        lr_dropout_masks: Optional[dict[str, torch.Tensor]] = None
+        if lr_dropout in ("y", "cpu"):
+            lr_dropout_masks = {}
+            lr_dropout_p = 0.3
             mask_device = torch.device("cpu") if lr_dropout == "cpu" else device
             for name, param in model.named_parameters():
                 if param.requires_grad:
@@ -426,6 +452,7 @@ class SAEHDTrainer:
             _logger.info(f"LR Dropout enabled (p={lr_dropout_p}, device={lr_dropout}), {len(lr_dropout_masks)} masks generated")
 
         # DFL cosine LR scheduler (oscillating, lr_cos=500 when lr_dropout enabled)
+        # Scale lr_cos by speed ratio vs DFL (~600ms/iter) to keep wall-clock period consistent
         lr_cos = 500 if lr_dropout in ("y", "cpu") else 0
         lr_scheduler: Optional[_DFLCosineScheduler] = None
         if lr_cos > 0:
@@ -448,9 +475,11 @@ class SAEHDTrainer:
             "d_mask_dims": d_mask_dims, "batch_size": batch_size,
             "learning_rate": learning_rate, "optimizer": optimizer_name,
             "use_amp": use_amp,
-            "random_warp": random_warp, "face_style_power": face_style_power,
-            "bg_style_power": bg_style_power, "eyes_mouth_prio": eyes_mouth_prio,
-            "masked_training": masked_training, "gan_power": gan_power,
+            "random_warp": random_warp, "random_src_flip": random_src_flip,
+            "random_dst_flip": random_dst_flip, "random_hsv_power": random_hsv_power,
+            "face_style_power": face_style_power, "bg_style_power": bg_style_power,
+            "eyes_mouth_prio": eyes_mouth_prio, "masked_training": masked_training,
+            "gan_power": gan_power, "gan_dims": gan_dims, "gan_patch_size": gan_patch_size,
             "lr_dropout": lr_dropout, "lr_cos": lr_cos,
             "pixel_loss": pixel_loss, "ca_weights": ca_weights,
             "src_face_scale": src_face_scale, "target_iter": target_iter,
@@ -458,7 +487,11 @@ class SAEHDTrainer:
             "write_preview_history": write_preview_history,
             "random_ct": random_ct, "ct_mode": ct_mode,
             "random_ct_sample_size": random_ct_sample_size,
-            "learn_mask": learn_mask, "gan_patch_size": gan_patch_size,
+            "learn_mask": learn_mask, "clipgrad": clipgrad,
+            "pretrain": pretrain, "blur_out_mask": blur_out_mask,
+            "true_face_power": true_face_power, "uniform_yaw": uniform_yaw,
+            "perceptual_power": perceptual_power,
+            "save_interval_min": save_interval_min, "preview_interval_sec": preview_interval_sec,
         }
         FileManager.atomic_write(model_dir / f"{_MODEL_PREFIX}_training_config.json", json.dumps(config, indent=2))
 
@@ -492,7 +525,9 @@ class SAEHDTrainer:
         # Preview setup
         self._preview_src_paths = FileManager.find_images(src_dir)
         self._preview_dst_paths = FileManager.find_images(dst_dir)
-        self._preview_n = min(4, batch_size, 800 // resolution)
+        self._preview_src_meta = MetadataManager.load_all(src_dir, lightweight=True)
+        self._preview_dst_meta = MetadataManager.load_all(dst_dir, lightweight=True)
+        self._preview_n = min(4, 800 // resolution)
         self._preview_resolution = resolution
 
         # DFL loss parameters
@@ -516,6 +551,8 @@ class SAEHDTrainer:
         iter_count = start_iter
         self._iter_count = iter_count
         pixel_loss_active = pixel_loss  # DFL: pixel_loss can be toggled during training
+        iter_ms_accum = 0.0
+        iter_ms_count = 0
 
         src_iter = iter(src_loader)
         dst_iter = iter(dst_loader)
@@ -573,7 +610,7 @@ class SAEHDTrainer:
                 y = torch.where(y == 0, torch.ones_like(y), y)
                 dst_target = dst_target * dst_mask + (x / y) * dst_mask_anti
 
-            with torch.amp.autocast(device.type, enabled=(use_amp and device.type == "cuda")):
+            with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_bf16):
                 out = model(src_warped, dst_warped)
 
                 pred_src_src = out["pred_src_src"]
@@ -602,12 +639,9 @@ class SAEHDTrainer:
                 else:
                     loss_src = 5.0 * _dssim(pred_src_src_opt, target_src_opt, filter_size=dssim_filter_size).mean()
                     loss_src = loss_src + 5.0 * _dssim(pred_src_src_opt, target_src_opt, filter_size=int(resolution / 23.2)).mean()
-                # MSE
                 loss_src = loss_src + 10.0 * ((target_src_opt - pred_src_src_opt) ** 2).mean()
-                # Mask loss
                 if learn_mask:
                     loss_src = loss_src + 10.0 * ((src_mask - pred_src_srcm) ** 2).mean()
-                # Eyes/mouth priority (DFL: use dedicated eyes_mouth mask)
                 if eyes_mouth_prio:
                     loss_src = loss_src + 300.0 * ((src_target * src_em_mask - pred_src_src * src_em_mask).abs()).mean()
 
@@ -653,15 +687,37 @@ class SAEHDTrainer:
                     loss = loss + 0.5 * F.l1_loss(pred_src_src_opt, target_src_opt)
                     loss = loss + 0.5 * F.l1_loss(pred_dst_dst_opt, target_dst_opt)
 
+                # --- VGG perceptual loss (improves texture, reduces MSE blur) ---
+                if perceptual_power > 0 and vgg_perceptual is not None:
+                    with torch.amp.autocast(device.type, enabled=False):
+                        loss = loss + perceptual_power * vgg_perceptual(pred_src_src_opt.float(), target_src_opt.float())
+                        loss = loss + perceptual_power * vgg_perceptual(pred_dst_dst_opt.float(), target_dst_opt.float())
+
                 # --- GAN generator loss (DFL style) ---
+                # Freeze enc+inter during GAN: recompute decoder output with
+                # detached enc+inter code so GAN gradients only update decoders,
+                # preventing feature extractor corruption (reference PyTorch improvement).
+                gan_loss_val = None
                 if gan_power != 0 and discriminator is not None:
-                    # GAN only on src-src self-reconstruction path (DFL design)
-                    fake_d_center, fake_d_unet = discriminator(pred_src_src_opt)
+                    # Recompute with detached encoder/inter output
+                    src_code_det = model.encoder(src_warped).detach()
+                    if not model.use_liae:
+                        src_inter_det = model.inter(src_code_det).detach()
+                        gan_pred_src, _ = model.decoder_src(src_inter_det)
+                    else:
+                        src_inter_AB_det = model.inter_AB(src_code_det).detach()
+                        gan_src_code = torch.cat([src_inter_AB_det, src_inter_AB_det], dim=1)
+                        gan_pred_src, _ = model.decoder(gan_src_code)
+                    if masked_training:
+                        gan_pred_opt = gan_pred_src * src_mask_blur
+                    else:
+                        gan_pred_opt = gan_pred_src
+                    fake_d_center, fake_d_unet = discriminator(gan_pred_opt)
                     ones_center = torch.ones_like(fake_d_center)
                     ones_unet = torch.ones_like(fake_d_unet)
                     gen_gan_loss = (F.binary_cross_entropy_with_logits(fake_d_center, ones_center) +
                                     F.binary_cross_entropy_with_logits(fake_d_unet, ones_unet))
-                    loss = loss + gan_power * gen_gan_loss
+                    gan_loss_val = gan_power * gen_gan_loss
 
                     # TV regularization (suppress GAN bright dots)
                     if masked_training:
@@ -675,46 +731,42 @@ class SAEHDTrainer:
 
                 # --- True face power: CodeDiscriminator G loss (DFL style) ---
                 if true_face_power != 0 and code_discriminator is not None:
-                    src_code = model.encode(src_warped)
-                    code_res = model.inter.get_out_res()
-                    src_code_2d = src_code.reshape(src_code.shape[0], model.ae_dims, code_res, code_res)
-                    src_code_d = code_discriminator(src_code_2d)
+                    src_code = model.inter(model.encoder(src_warped))
+                    src_code_d = code_discriminator(src_code)
                     ones_code = torch.ones_like(src_code_d)
                     loss = loss + true_face_power * F.binary_cross_entropy_with_logits(src_code_d, ones_code)
 
             optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            if clipgrad:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            loss.backward()
 
-            # LR Dropout: apply fixed Bernoulli masks to gradients
+            # GAN loss backward separately (only updates decoders,
+            # enc/inter detached so their grads are not affected)
+            if gan_loss_val is not None:
+                gan_loss_val.backward()
+
+            if clipgrad:
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             if lr_dropout_masks:
-                scaler.unscale_(optimizer)
                 for name, param in model.named_parameters():
                     if param.grad is not None and name in lr_dropout_masks:
                         param.grad.data.mul_(lr_dropout_masks[name])
 
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
 
             # DFL cosine LR scheduler step
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
-            # --- Discriminator step (DFL: 1:1 D/G ratio) ---
+            # --- Discriminator step (DFL: 1:1 D/G ratio) + R1 gradient penalty ---
             if gan_power != 0 and discriminator is not None and disc_optimizer is not None:
-                with torch.amp.autocast(device.type, enabled=(use_amp and device.type == "cuda")):
-                    # Real: discriminator should output 1
+                with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_bf16):
                     real_d_center, real_d_unet = discriminator(src_target)
                     ones_c = torch.ones_like(real_d_center)
                     zeros_c = torch.zeros_like(real_d_center)
-                    # Fake: discriminator should output 0 (detach from G)
                     fake_d_center, fake_d_unet = discriminator(pred_src_src_opt.detach())
                     zeros_u = torch.zeros_like(fake_d_unet)
                     ones_u = torch.ones_like(real_d_unet)
 
-                    # D loss: BCE(real→1) + BCE(fake→0), dual output each 0.5 weight
                     disc_loss = 0.5 * (
                         F.binary_cross_entropy_with_logits(real_d_center, ones_c) +
                         F.binary_cross_entropy_with_logits(fake_d_center, zeros_c)
@@ -723,21 +775,32 @@ class SAEHDTrainer:
                         F.binary_cross_entropy_with_logits(fake_d_unet, zeros_u)
                     )
 
+                if iter_count % 16 == 0:
+                    real_img = src_target.detach().requires_grad_(True)
+                    with torch.amp.autocast(device.type, enabled=False):
+                        r_center, r_unet = discriminator(real_img.float())
+                        r1_penalty = 0.0
+                        for r_out in [r_center, r_unet]:
+                            r_grad = torch.autograd.grad(
+                                outputs=r_out.sum(), inputs=real_img,
+                                create_graph=True, retain_graph=True
+                            )[0]
+                            r1_penalty = r1_penalty + r_grad.view(r_grad.shape[0], -1).norm(2, dim=1).square().mean()
+                        r1_gamma = 10.0
+                        disc_loss = disc_loss + 0.5 * r1_gamma * r1_penalty
+
                 disc_optimizer.zero_grad(set_to_none=True)
-                scaler.scale(disc_loss).backward()
-                scaler.step(disc_optimizer)
+                disc_loss.backward()
+                disc_optimizer.step()
 
             # --- CodeDiscriminator step (true_face_power) ---
             if true_face_power != 0 and code_discriminator is not None and code_disc_optimizer is not None:
-                with torch.amp.autocast(device.type, enabled=(use_amp and device.type == "cuda")):
-                    code_res = model.inter.get_out_res()
-                    src_code = model.encode(src_warped).detach()
-                    dst_code = model.encode(dst_warped).detach()
-                    src_code_2d = src_code.reshape(src_code.shape[0], model.ae_dims, code_res, code_res)
-                    dst_code_2d = dst_code.reshape(dst_code.shape[0], model.ae_dims, code_res, code_res)
+                with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_bf16):
+                    src_code = model.inter(model.encoder(src_warped)).detach()
+                    dst_code = model.inter(model.encoder(dst_warped)).detach()
 
-                    src_code_d = code_discriminator(src_code_2d)
-                    dst_code_d = code_discriminator(dst_code_2d)
+                    src_code_d = code_discriminator(src_code)
+                    dst_code_d = code_discriminator(dst_code)
                     ones_code = torch.ones_like(dst_code_d)
                     zeros_code = torch.zeros_like(src_code_d)
 
@@ -747,12 +810,30 @@ class SAEHDTrainer:
                     )
 
                 code_disc_optimizer.zero_grad(set_to_none=True)
-                scaler.scale(code_disc_loss).backward()
-                scaler.step(code_disc_optimizer)
+                code_disc_loss.backward()
+                code_disc_optimizer.step()
 
             iter_count += 1
             self._iter_count = iter_count
             iter_ms = (time.time() - t0) * 1000
+
+            # Auto-scale lr_cos to match DFL wall-clock period (~600ms/iter baseline)
+            # Accumulate 30 iters for stable estimate, cap speed_ratio at 4x
+            if lr_scheduler is not None and iter_ms_count < 30:
+                iter_ms_accum += iter_ms
+                iter_ms_count += 1
+                if iter_ms_count == 30:
+                    avg_iter_ms = iter_ms_accum / iter_ms_count
+                    speed_ratio = min(4.0, max(1.0, 600.0 / max(avg_iter_ms, 1.0)))
+                    if speed_ratio > 1.2:
+                        old_lr_cos = lr_scheduler.lr_cos
+                        new_lr_cos = int(old_lr_cos * speed_ratio)
+                        lr_scheduler.lr_cos = new_lr_cos
+                        lr_scheduler._step_count = 0
+                        _logger.info(
+                            f"LR scheduler auto-scaled: lr_cos {old_lr_cos} -> {new_lr_cos} "
+                            f"(speed_ratio={speed_ratio:.1f}x, avg_iter_ms={avg_iter_ms:.0f})"
+                        )
             loss_val = loss.item()
             if not math.isfinite(loss_val):
                 _logger.warning(f"NaN/Inf loss at iter #{iter_count}, skipping")
@@ -763,6 +844,8 @@ class SAEHDTrainer:
 
             if on_iter is not None:
                 on_iter(iter_count, loss_val, iter_ms)
+
+
 
             now = time.time()
 
@@ -843,15 +926,15 @@ class SAEHDTrainer:
         model.eval()
         n = self._preview_n
 
-        src_samples = self._sample_images(self._preview_src_paths, n, resolution)
-        dst_samples = self._sample_images(self._preview_dst_paths, n, resolution)
+        src_samples = self._sample_images(self._preview_src_paths, n, resolution, self._preview_src_meta)
+        dst_samples = self._sample_images(self._preview_dst_paths, n, resolution, self._preview_dst_meta)
 
         rows = []
         if src_samples and dst_samples:
             for i in range(min(len(src_samples), len(dst_samples))):
-                s_bgr, s_img_t = src_samples[i]
-                d_bgr, d_img_t = dst_samples[i]
-                row = self._preview_row(model, device, s_bgr, s_img_t, d_bgr, d_img_t)
+                s_bgr, s_img_t, s_mask = src_samples[i]
+                d_bgr, d_img_t, d_mask = dst_samples[i]
+                row = self._preview_row(model, device, s_bgr, s_img_t, s_mask, d_bgr, d_img_t, d_mask)
                 rows.append(row)
 
         model.train()
@@ -869,9 +952,9 @@ class SAEHDTrainer:
         return (np.clip(final, 0, 1) * 255).astype(np.uint8)
 
     def _preview_row(self, model: SAEHDModel, device: torch.device,
-                     s_bgr: np.ndarray, s_img_t: torch.Tensor,
-                     d_bgr: np.ndarray, d_img_t: torch.Tensor) -> np.ndarray:
-        """DFL preview: S | SS | D | DD | SD  (raw model output, no mask compositing)"""
+                     s_bgr: np.ndarray, s_img_t: torch.Tensor, s_mask: np.ndarray,
+                     d_bgr: np.ndarray, d_img_t: torch.Tensor, d_mask: np.ndarray) -> np.ndarray:
+        """DFL raw preview: S | SS | D | DD | SD"""
         S = s_bgr.astype(np.float32) / 255.0
         D = d_bgr.astype(np.float32) / 255.0
 
@@ -885,13 +968,12 @@ class SAEHDTrainer:
             DD = out["pred_dst_dst"].squeeze(0).permute(1, 2, 0).cpu().numpy()
             SD = out["pred_src_dst"].squeeze(0).permute(1, 2, 0).cpu().numpy()
 
-        S_rgb = S[:, :, ::-1]
-        D_rgb = D[:, :, ::-1]
+        row = np.concatenate([S, SS, D, DD, SD], axis=1)
 
-        row = np.concatenate([S_rgb, SS, D_rgb, DD, SD], axis=1)
-        return np.clip(row, 0, 1)[:, :, ::-1].copy()
+        return np.clip(row, 0, 1)
 
-    def _sample_images(self, paths: list[Path], n: int, resolution: int) -> list[tuple[np.ndarray, torch.Tensor]]:
+    def _sample_images(self, paths: list[Path], n: int, resolution: int,
+                       meta_dict: Optional[dict] = None) -> list[tuple[np.ndarray, torch.Tensor, np.ndarray]]:
         if not paths:
             return []
         sampled = random.sample(paths, min(n, len(paths)))
@@ -906,9 +988,11 @@ class SAEHDTrainer:
             if img is None:
                 continue
             resized = cv2.resize(img, (resolution, resolution))
-            img_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            img_t = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-            entry = (resized, img_t)
+            img_t = torch.from_numpy(resized.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+            meta = meta_dict.get(p.name) if meta_dict else None
+            face_mask, _ = _generate_masks(resolution, meta)
+            mask_f = face_mask.astype(np.float32) / 255.0
+            entry = (resized, img_t, mask_f)
             self._preview_cache[cache_key] = entry
             result.append(entry)
         return result

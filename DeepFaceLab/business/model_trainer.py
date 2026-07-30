@@ -442,7 +442,7 @@ class ModelTrainer:
             all_params += list(inter.parameters())
         optimizer_name = kwargs.get("optimizer", "adamw")
         if optimizer_name == "adamw":
-            optimizer = torch.optim.AdamW(all_params, lr=learning_rate)
+            optimizer = torch.optim.AdamW(all_params, lr=learning_rate, weight_decay=1e-5)
         elif optimizer_name == "adabelief":
             from DeepFaceLab.shared.adabelief import AdaBelief
             optimizer = AdaBelief(all_params, lr=learning_rate)
