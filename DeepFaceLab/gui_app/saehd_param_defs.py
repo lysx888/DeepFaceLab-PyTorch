@@ -19,7 +19,7 @@ SAEHD_PARAM_DEFS: list[ParamDef] = [
     ParamDef(key="write_preview_history", label="Save preview history", type=ParamType.BOOL, default=False, group=ParamGroup.BASIC),
 
     # === ARCHITECTURE — DFL首次运行参数 ===
-    ParamDef(key="architecture", label="AE architecture:", type=ParamType.STR, default="df-ud", choices=["df", "liae", "df-d", "liae-d", "df-ud", "liae-ud", "df-udt", "liae-udt", "df-t", "liae-t", "df-td", "liae-td"], group=ParamGroup.ARCHITECTURE),
+    ParamDef(key="architecture", label="AE architecture:", type=ParamType.STR, default="df-ud", choices=["df", "liae", "df-d", "liae-d", "df-ud", "liae-ud", "df-udt", "liae-udt", "df-t", "liae-t", "df-td", "liae-td", "df-udc", "liae-udc", "df-udtc", "liae-udtc", "df-tc", "liae-tc", "df-tdc", "liae-tdc", "df-c", "liae-c", "df-dc", "liae-dc"], group=ParamGroup.ARCHITECTURE),
     ParamDef(key="ae_dims", label="AutoEncoder dims:", type=ParamType.INT, default=256, min_val=32, max_val=1024, step=32, decimals=0, group=ParamGroup.ARCHITECTURE),
     ParamDef(key="e_dims", label="Encoder dims:", type=ParamType.INT, default=32, min_val=16, max_val=256, step=16, decimals=0, group=ParamGroup.ARCHITECTURE),
     ParamDef(key="d_dims", label="Decoder dims:", type=ParamType.INT, default=32, min_val=16, max_val=256, step=16, decimals=0, group=ParamGroup.ARCHITECTURE),
@@ -50,6 +50,7 @@ SAEHD_HIDDEN_PARAMS = {
     "preview_interval_sec": 60,
     "src_face_scale": 0,
     "pixel_loss": False,
+    "perceptual_power": 0.0,
 }
 
 DFL_FACE_TYPE_MAP = {

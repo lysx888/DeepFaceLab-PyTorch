@@ -1357,7 +1357,7 @@ class Step4Train(StepPanel):
         saehd_layout.setSpacing(6)
 
         self._saehd_param_groups: dict[ParamGroup, ParamGroupWidget] = {}
-        for group in [ParamGroup.BASIC, ParamGroup.ARCHITECTURE, ParamGroup.FACE_DETAIL]:
+        for group in [ParamGroup.BASIC, ParamGroup.ARCHITECTURE, ParamGroup.FACE_DETAIL, ParamGroup.LOSS_SAMPLING]:
             pw = ParamGroupWidget(group, get_saehd_params_by_group(group))
             self._saehd_param_groups[group] = pw
             saehd_layout.addWidget(pw)

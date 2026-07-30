@@ -315,7 +315,7 @@ class PreviewThumbnailBar(QWidget):
             th = int(110 * scale)
             tw = int(th * w / max(h, 1))
             thumb_rgb = thumb_bgr[:, :, ::-1].copy()
-            qimg = QImage(thumb_rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888)
+            qimg = QImage(thumb_rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
             pixmap = QPixmap.fromImage(qimg).scaled(tw, th, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             self._thumbnail_labels[i].setPixmap(pixmap)
             self._thumbnail_labels[i].setFixedHeight(th + 4)
