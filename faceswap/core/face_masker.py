@@ -5,12 +5,16 @@ from typing import Optional
 import cv2
 import numpy as np
 import onnxruntime as ort
+import torch
 
 from faceswap.core.face_parsing_adapter import (
     FaceParsingAdapter, INCLUDE_LABELS, EXCLUDE_LABELS, HEAD_LABELS,
     CLASS_EYEGLASSES, CLASS_EARRING, CLASS_HAIR,
 )
 from faceswap.core.auto_mask_generator import AutoMaskResult, _mask_to_polys, _morphology_clean
+from faceswap.core.dfl_weight_loader import load_dfl_xseg_weights
+from faceswap.models.xseg_model import XSegNet
+from faceswap.shared.config import auto_select_device
 from faceswap.setting import FACE_OCCLUDER_MODEL_DIR
 
 _logger = logging.getLogger(__name__)
@@ -94,6 +98,76 @@ class FaceOccluder:
         self._sessions.clear()
 
 
+_DFL_NPY_FILENAME = "XSeg_256.npy"
+
+
+class FaceOccluderPyTorch:
+    _instance: Optional["FaceOccluderPyTorch"] = None
+
+    @classmethod
+    def get_instance(cls) -> "FaceOccluderPyTorch":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        self._model: Optional[XSegNet] = None
+        self._device: Optional[torch.device] = None
+        self._loaded: bool = False
+        self._first_inference: bool = True
+
+    def is_available(self) -> bool:
+        try:
+            return (FACE_OCCLUDER_MODEL_DIR / _DFL_NPY_FILENAME).exists()
+        except Exception:
+            return False
+
+    def _ensure_model_loaded(self) -> None:
+        if self._loaded:
+            return
+        npy_path = FACE_OCCLUDER_MODEL_DIR / _DFL_NPY_FILENAME
+        model = XSegNet(resolution=256, base_ch=32)
+        load_dfl_xseg_weights(npy_path, model)
+        device = auto_select_device()
+        try:
+            model = model.to(device)
+        except RuntimeError as e:
+            _logger.warning(f"CUDA加载失败，降级到CPU: {e}")
+            device = torch.device('cpu')
+            model = model.to(device)
+        model.eval()
+        self._model = model
+        self._device = device
+        self._loaded = True
+
+    def predict(self, image_bgr: np.ndarray) -> np.ndarray:
+        if image_bgr is None or image_bgr.size == 0:
+            raise ValueError("输入图片为空")
+        self._ensure_model_loaded()
+        h, w = image_bgr.shape[:2]
+        image_rgb = image_bgr[:, :, ::-1]
+        resized = cv2.resize(image_rgb, (256, 256), interpolation=cv2.INTER_LINEAR)
+        blob = resized.astype(np.float32) / 255.0
+        tensor = torch.from_numpy(blob).permute(2, 0, 1).unsqueeze(0).to(self._device)
+        with torch.no_grad():
+            logits = self._model.forward(tensor, skip_enabled=True)
+            prob = torch.sigmoid(logits)
+        mask = prob.cpu().numpy()[0, 0]
+        if mask.shape != (h, w):
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+        if self._first_inference:
+            _logger.info(f"DFL XSeg首次推理: device={self._device}, 输入={image_bgr.shape[:2]}, 输出={mask.shape}")
+            self._first_inference = False
+        return mask.astype(np.float32)
+
+    def release(self) -> None:
+        self._model = None
+        self._device = None
+        self._loaded = False
+        self._first_inference = True
+        FaceOccluderPyTorch._instance = None
+
+
 class FaceMasker:
     _instance: Optional["FaceMasker"] = None
 
@@ -106,6 +180,7 @@ class FaceMasker:
     def __init__(self):
         self._face_parsing = FaceParsingAdapter.get_instance()
         self._face_occluder = FaceOccluder.get_instance()
+        self._face_occluder_pytorch = FaceOccluderPyTorch.get_instance()
 
     def auto_draw_mask(
         self,
@@ -146,6 +221,24 @@ class FaceMasker:
         result.exclude_polys = _mask_to_polys(exclude_mask, _EXCLUDE_EPSILON_FACTOR, _MIN_EXCLUDE_AREA)
         return result
 
+    def auto_draw_mask_dfl(
+        self,
+        image_bgr: np.ndarray,
+    ) -> AutoMaskResult:
+        result = AutoMaskResult()
+        if not self._face_occluder_pytorch.is_available():
+            _logger.warning("DFL遮罩不可用: XSeg_256.npy文件不存在")
+            return result
+        try:
+            mask = self._face_occluder_pytorch.predict(image_bgr)
+        except Exception as e:
+            _logger.warning(f"DFL遮罩推理失败: {e}")
+            return result
+        include_mask = ((mask > 0.5) * 255).astype(np.uint8)
+        include_mask = _morphology_clean(include_mask)
+        result.include_polys = _mask_to_polys(include_mask, _INCLUDE_EPSILON_FACTOR, _MIN_INCLUDE_AREA)
+        return result
+
     def create_occlusion_mask(
         self,
         image_bgr: np.ndarray,
@@ -175,3 +268,4 @@ class FaceMasker:
     def release(self):
         self._face_parsing.release()
         self._face_occluder.release()
+        self._face_occluder_pytorch.release()
