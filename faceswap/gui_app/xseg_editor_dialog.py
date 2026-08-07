@@ -321,6 +321,14 @@ class _XSegCanvas(QWidget):
         result = masker.auto_draw_mask(self._image, use_occlusion=True)
         self._apply_auto_mask_result(result)
 
+    def auto_mask_dfl(self):
+        if self._image is None:
+            return
+        from faceswap.core.face_masker import FaceMasker
+        masker = FaceMasker.get_instance()
+        result = masker.auto_draw_mask_dfl(self._image)
+        self._apply_auto_mask_result(result)
+
     def auto_mask_simple(self, landmarks_106: np.ndarray):
         if self._image is None:
             return
@@ -1173,6 +1181,7 @@ class XSegEditorDialog(QDialog):
         lt_outer.addWidget(frame3)
 
         lt_outer.addStretch()
+        left_toolbar.setMinimumWidth(72)
         main_split.addWidget(left_toolbar)
 
         # ========== Center ==========
@@ -1299,6 +1308,17 @@ class XSegEditorDialog(QDialog):
         fp_btn.setStyleSheet(_ICON_BTN_STYLE_NP)
         fp_btn.clicked.connect(self._auto_mask_face_parsing)
         rf3_lay.addWidget(fp_btn)
+        self._fp_btn = fp_btn
+
+        dfl_btn = QPushButton(_load_icon("zhezhao0.png"), "")
+        dfl_btn.setIconSize(_TOOLBAR_ICON_SIZE)
+        dfl_btn.setToolTip("DFL遮罩自动绘制\n基于DFL XSeg权重(PyTorch)直接输出人脸遮罩\n生成include多边形")
+        dfl_btn.setStyleSheet(_ICON_BTN_STYLE_NP)
+        dfl_btn.clicked.connect(self._auto_mask_dfl)
+        rf3_lay.addWidget(dfl_btn)
+        self._dfl_btn = dfl_btn
+        from faceswap.core.face_masker import FaceOccluderPyTorch
+        dfl_btn.setEnabled(FaceOccluderPyTorch.get_instance().is_available())
 
         sam3_btn = QPushButton(_load_icon("sam3xseg.png"), "")
         sam3_btn.setIconSize(_TOOLBAR_ICON_SIZE)
@@ -1306,6 +1326,7 @@ class XSegEditorDialog(QDialog):
         sam3_btn.setStyleSheet(_ICON_BTN_STYLE_NP_MT)
         sam3_btn.clicked.connect(self._auto_mask_sam3)
         rf3_lay.addWidget(sam3_btn)
+        self._sam3_btn = sam3_btn
 
         sam2_btn = QPushButton(_load_icon("sam2xseg.png"), "")
         sam2_btn.setIconSize(_TOOLBAR_ICON_SIZE)
@@ -1319,6 +1340,7 @@ class XSegEditorDialog(QDialog):
         rt_outer.addWidget(rframe3)
 
         rt_outer.addStretch()
+        right_toolbar.setMinimumWidth(72)
         main_split.addWidget(right_toolbar)
 
         main_split.setStretchFactor(0, 0)
@@ -1419,7 +1441,13 @@ class XSegEditorDialog(QDialog):
             self._btn_include.setEnabled(True)
             self._btn_exclude.setEnabled(True)
         self._btn_pt_edit_mode.setChecked(self._canvas._pt_edit_mode == _PTEditMode.ADD_DEL)
-        self._sam2_btn.setChecked(self._canvas._op_mode == _OpMode.SAM2_BOX)
+        is_sam2_active = self._canvas._op_mode == _OpMode.SAM2_BOX
+        self._sam2_btn.setChecked(is_sam2_active)
+        if not is_sam2_active and not self._fp_btn.isEnabled():
+            self._fp_btn.setEnabled(True)
+            self._sam3_btn.setEnabled(True)
+            from faceswap.core.face_masker import FaceOccluderPyTorch
+            self._dfl_btn.setEnabled(FaceOccluderPyTorch.get_instance().is_available())
 
     def _toggle_pt_edit_mode(self):
         if self._canvas._op_mode == _OpMode.EDIT_PTS:
@@ -1485,6 +1513,10 @@ class XSegEditorDialog(QDialog):
             return
         if not self._confirm_clear_polys():
             return
+        self._sam2_btn.setEnabled(False)
+        self._sam3_btn.setEnabled(False)
+        self._dfl_btn.setEnabled(False)
+        QApplication.processEvents()
         try:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             self._canvas.auto_mask_face_parsing()
@@ -1496,16 +1528,50 @@ class XSegEditorDialog(QDialog):
             QApplication.restoreOverrideCursor()
             from faceswap.core.face_masker import FaceMasker
             FaceMasker.get_instance().release()
+            self._sam2_btn.setEnabled(True)
+            self._sam3_btn.setEnabled(True)
+            from faceswap.core.face_masker import FaceOccluderPyTorch
+            self._dfl_btn.setEnabled(FaceOccluderPyTorch.get_instance().is_available())
+
+    def _auto_mask_dfl(self):
+        if self._current_idx < 0 or self._current_idx >= len(self._images):
+            return
+        if not self._confirm_clear_polys():
+            return
+        self._fp_btn.setEnabled(False)
+        self._sam3_btn.setEnabled(False)
+        self._sam2_btn.setEnabled(False)
+        QApplication.processEvents()
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self._canvas.auto_mask_dfl()
+            self._refresh_annotated_count()
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"DFL遮罩自动绘制失败: {e}", exc_info=True)
+        finally:
+            QApplication.restoreOverrideCursor()
+            from faceswap.core.face_masker import FaceOccluderPyTorch
+            FaceOccluderPyTorch.get_instance().release()
+            self._fp_btn.setEnabled(True)
+            self._sam3_btn.setEnabled(True)
+            self._sam2_btn.setEnabled(True)
+            self._dfl_btn.setEnabled(FaceOccluderPyTorch.get_instance().is_available())
 
     def _toggle_sam2_mode(self):
         if self._current_idx < 0 or self._current_idx >= len(self._images):
             return
+        from faceswap.core.face_masker import FaceOccluderPyTorch
         was_active = self._canvas._op_mode == _OpMode.SAM2_BOX
         if not was_active and not self._confirm_clear_polys():
             return
         self._canvas.enter_sam2_box_mode()
-        self._sam2_btn.setChecked(self._canvas._op_mode == _OpMode.SAM2_BOX)
-        if was_active and self._canvas._op_mode != _OpMode.SAM2_BOX:
+        is_active = self._canvas._op_mode == _OpMode.SAM2_BOX
+        self._sam2_btn.setChecked(is_active)
+        self._fp_btn.setEnabled(not is_active)
+        self._sam3_btn.setEnabled(not is_active)
+        self._dfl_btn.setEnabled(not is_active and FaceOccluderPyTorch.get_instance().is_available())
+        if was_active and not is_active:
             from faceswap.core.sam2_segmenter import SAM2Segmenter
             SAM2Segmenter.get_instance().release()
 
@@ -1514,6 +1580,10 @@ class XSegEditorDialog(QDialog):
             return
         if not self._confirm_clear_polys():
             return
+        self._fp_btn.setEnabled(False)
+        self._sam2_btn.setEnabled(False)
+        self._dfl_btn.setEnabled(False)
+        QApplication.processEvents()
         try:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             self._canvas.auto_mask_sam3()
@@ -1525,6 +1595,10 @@ class XSegEditorDialog(QDialog):
             QApplication.restoreOverrideCursor()
             from faceswap.core.sam3_segmenter import SAM3Segmenter
             SAM3Segmenter.get_instance().release()
+            self._fp_btn.setEnabled(True)
+            self._sam2_btn.setEnabled(True)
+            from faceswap.core.face_masker import FaceOccluderPyTorch
+            self._dfl_btn.setEnabled(FaceOccluderPyTorch.get_instance().is_available())
 
     def keyPressEvent(self, event: QKeyEvent):
         key = event.key()
@@ -1537,8 +1611,11 @@ class XSegEditorDialog(QDialog):
         elif key == Qt.Key.Key_M:
             self._auto_mask_face_parsing()
         elif key == Qt.Key.Key_Escape:
-            self._canvas._save_current_polys()
-            self.accept()
+            if self._canvas._op_mode == _OpMode.SAM2_BOX:
+                self._toggle_sam2_mode()
+            else:
+                self._canvas._save_current_polys()
+                self.accept()
         else:
             self._canvas.keyPressEvent(event)
 

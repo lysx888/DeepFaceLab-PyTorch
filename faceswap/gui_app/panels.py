@@ -2,6 +2,7 @@ import json
 import sys
 import threading
 import subprocess
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -1396,6 +1397,7 @@ class Step3XSeg(StepPanel):
         self._log_throttle_time = 0.0
         self._log_throttle_interval = 0.5
         self._log_need_newline = True
+        self._loss_smooth_buffer = deque(maxlen=100)
 
         def _on_iter(iter_count, loss_val, iter_ms):
             import time as _time
@@ -1403,13 +1405,15 @@ class Step3XSeg(StepPanel):
             if now - self._log_throttle_time < self._log_throttle_interval:
                 return
             self._log_throttle_time = now
+            self._loss_smooth_buffer.append(loss_val)
+            smoothed = sum(self._loss_smooth_buffer) / len(self._loss_smooth_buffer)
             from datetime import datetime
             ts = datetime.now().strftime("%H:%M:%S")
             if iter_ms >= 1000:
                 time_str = f"{iter_ms/1000:.1f}s"
             else:
                 time_str = f"{int(iter_ms)}ms"
-            line = f"[{ts}][#{iter_count}][{time_str}][loss {loss_val:.5f}]"
+            line = f"[{ts}][#{iter_count}][{time_str}][loss {smoothed:.5f}]"
 
             overwrite = not self._log_need_newline
             self._log_need_newline = False
@@ -1761,6 +1765,7 @@ class Step4Train(StepPanel):
         self._log_text.clear()
         self._log_need_newline = True
         self._log_throttle_time = 0.0
+        self._loss_smooth_buffer = deque(maxlen=100)
 
         signals = self._signals
         panel = self
@@ -1777,16 +1782,18 @@ class Step4Train(StepPanel):
             from datetime import datetime
             ts = datetime.now().strftime("%H:%M:%S")
             loss_val = (src_loss + dst_loss) / 2
+            panel._loss_smooth_buffer.append(loss_val)
+            smoothed = sum(panel._loss_smooth_buffer) / len(panel._loss_smooth_buffer)
             if iter_ms >= 1000:
                 time_str = f"{iter_ms/1000:.1f}s"
             else:
                 time_str = f"{int(iter_ms)}ms"
-            line = f"[{ts}][#{iter_num}][{time_str}][src {src_loss:.5f} dst {dst_loss:.5f}][loss {loss_val:.5f}]"
+            line = f"[{ts}][#{iter_num}][{time_str}][src {src_loss:.5f} dst {dst_loss:.5f}][loss {smoothed:.5f}]"
 
             overwrite = not panel._log_need_newline
             panel._log_need_newline = False
             signals.log_signal.emit(line, overwrite)
-            signals.iter_signal.emit(iter_num, loss_val, iter_ms)
+            signals.iter_signal.emit(iter_num, smoothed, iter_ms)
 
         def _on_preview(preview_bgr):
             panel._preview_signal.preview_ready.emit(preview_bgr)
@@ -1849,6 +1856,8 @@ class Step4Train(StepPanel):
                     pretrain_w = basic_pw._param_widgets["pretrain"]
                     pretrain_w.setEnabled(False)
                     pretrain_w.setToolTip("已退出预训练模式，不可回退")
+            if saved:
+                self._lock_architecture_params()
 
     def _on_iter_status(self, iter_num: int, loss: float, ms: float):
         self._status_bar.update_status(iter_num, loss, ms)
