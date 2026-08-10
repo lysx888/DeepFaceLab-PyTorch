@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from faceswap.core.saehd_utils import gaussian_blur
+from faceswap.setting import VGG19_MODEL_PATH
 
 
 def _gaussian_kernel_2d(size: int, sigma: float,
@@ -143,11 +144,12 @@ class VGGFeatureExtractor(nn.Module):
     _IMAGENET_MEAN = [0.485, 0.456, 0.406]
     _IMAGENET_STD = [0.229, 0.224, 0.225]
 
-    def __init__(self, layer_ids: tuple[int, ...] = (3, 8, 13, 19),
+    def __init__(self, layer_ids: tuple[int, ...] = (3, 8, 13, 21),
                  norm_mode: str = 'face'):
         super().__init__()
         from torchvision import models as tv_models
-        vgg = tv_models.vgg16(weights=tv_models.VGG16_Weights.IMAGENET1K_V1)
+        vgg = tv_models.vgg19(weights=None)
+        vgg.load_state_dict(torch.load(str(VGG19_MODEL_PATH), map_location='cpu'))
         self.features = vgg.features
         self._layer_ids = sorted(layer_ids)
         self._norm_mode = norm_mode

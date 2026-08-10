@@ -150,7 +150,7 @@ class SAEHDModel(BaseModel):
             try:
                 self.vgg_extractor = VGGFeatureExtractor(norm_mode='face').to(self.device)
             except Exception as e:
-                _logger.warning(f"VGG16 init failed ({e}), perceptual loss disabled")
+                _logger.warning(f"VGG19 init failed ({e}), perceptual loss disabled")
 
     def eval(self):
         for m in self._modules_dict.values():
