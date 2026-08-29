@@ -1072,7 +1072,7 @@ class ManualAnnotatorDialog(QDialog):
         self._canvas.update()
 
     def _toggle_visibility(self):
-        canvas = self._edit_canvas if self._editing else self._canvas
+        canvas = self._canvas
         active = canvas._active_idx
         if active >= 0 and active in canvas._landmarks_106:
             canvas.toggle_point_visibility(active)
