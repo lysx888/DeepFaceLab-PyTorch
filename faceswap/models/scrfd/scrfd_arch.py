@@ -386,13 +386,17 @@ class SCRFDNet(nn.Module):
 
             def forward(self, x):
                 cls_scores, bbox_preds, kps_preds = self.scrfd(x)
-                outs = []
+                scores_outs = []
+                bbox_outs = []
+                kps_outs = []
                 for i in range(len(cls_scores)):
                     cs = cls_scores[i].permute(0, 2, 3, 1).reshape(1, -1, 1).sigmoid()
                     bp = bbox_preds[i].permute(0, 2, 3, 1).reshape(1, -1, 4)
                     kp = kps_preds[i].permute(0, 2, 3, 1).reshape(1, -1, 10)
-                    outs.extend([cs, bp, kp])
-                return tuple(outs)
+                    scores_outs.append(cs)
+                    bbox_outs.append(bp)
+                    kps_outs.append(kp)
+                return tuple(scores_outs + bbox_outs + kps_outs)
 
         wrapper = _ExportWrapper(self)
         wrapper.eval()
