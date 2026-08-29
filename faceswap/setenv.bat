@@ -3,6 +3,9 @@ rem ========== BASE ENV ==========
 SET ROOT_DIR=%~dp0
 SET ROOT_DIR=%ROOT_DIR:~0,-1%
 
+rem ========== MSVC ENV (for gsplat JIT compile) ==========
+call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+
 rem overriding windows user/local environment
 SET LOCALENV_DIR=%ROOT_DIR%\_local
 SET TMP=%LOCALENV_DIR%\t
@@ -28,6 +31,11 @@ rem ========== CUDA ENV (from PyTorch) ==========
 SET TORCH_LIB_PATH=%PYTHON_LIB_PATH%\torch\lib
 SET PATH=%TORCH_LIB_PATH%;%PYTHON_PATH%;%PYTHON_PATH%\Scripts;%PATH%
 
+rem ========== MSVC Redist (for CUDA JIT compiled .pyd) ==========
+rem vcruntime140.dll is in VC145.CRT (not VC143), must be on PATH
+SET MSVC_REDIST_X64=%ProgramFiles(x86)%\Microsoft Visual Studio\18\BuildTools\VC\Redist\MSVC\14.51.36231\x64\Microsoft.VC145.CRT
+SET PATH=%MSVC_REDIST_X64%;%PATH%
+
 rem ========== DLL SEARCH PATH ==========
 rem Embedded Python needs os.add_dll_directory for torch
 SET DFL_DLL_DIRS=%TORCH_LIB_PATH%
@@ -42,7 +50,7 @@ rem PyTorch thread control - set by configure_torch() per task
 rem Do NOT set OMP/MKL here; each module sets its own value
 rem DataLoader workers: 1 thread each (set by worker_init_fn)
 
-rem Force UTF-8 mode for triton/torch.compile on Chinese Windows
+rem Force UTF-8 mode for triton/torch.compile on Chinese Windows (fixes GBK UnicodeDecodeError in inductor)
 SET PYTHONUTF8=1
 
 rem ========== ADDITIONAL ENV ==========

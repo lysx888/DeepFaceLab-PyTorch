@@ -29,14 +29,18 @@ DATA_DST_MERGED_DIR: Final[Path] = _WORKSPACE_ROOT / "data_dst" / "merged"
 DATA_DST_MERGED_MASK_DIR: Final[Path] = _WORKSPACE_ROOT / "data_dst" / "merged_mask"
 DATA_SRC_ALIGNED_TRASH_DIR: Final[Path] = _WORKSPACE_ROOT / "data_src" / "aligned_trash"
 DATA_DST_ALIGNED_TRASH_DIR: Final[Path] = _WORKSPACE_ROOT / "data_dst" / "aligned_trash"
-XSEG_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model"
+XSEG_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "xseg"
 
 SAEHD_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "saehd"
+AMP_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "amp"
+QUICK96_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "quick96"
 PRETRAIN_DATA_DIR: Final[Path] = _WORKSPACE_ROOT / "pretrain_faces"
 
 INSIGHTFACE_TRAIN_DIR: Final[Path] = _WORKSPACE_ROOT / "insightface_train"
 INSIGHTFACE_MANUAL_ANNOTATED_DIR: Final[Path] = _WORKSPACE_ROOT / "insightface_train" / "manual_annotated"
 INSIGHTFACE_TO_ANNOTATE_DIR: Final[Path] = _WORKSPACE_ROOT / "insightface_train" / "to_annotate"
+IF_LANDMARK_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "if_landmark"
+SCRFD_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "scrfd"
 
 DATA_SRC_VIDEO_PATTERN: Final[str] = "data_src.*"
 DATA_DST_VIDEO_PATTERN: Final[str] = "data_dst.*"
@@ -51,7 +55,8 @@ DEFAULT_BATCH_SIZE: Final[int] = 4
 LANDMARK_POINTS: Final[int] = 106
 KPS5_POINTS: Final[int] = 5
 
-VGG19_MODEL_PATH: Final[Path] = _WEIGHTS_ROOT / "vgg19-dcbb9e9d.pth"
+ARCFACE_MODEL_PATH: Final[Path] = _WEIGHTS_ROOT / "models" / "antelopev2" / "glintr100.onnx"
+ARCFACE_PTH_MODEL_PATH: Final[Path] = _WEIGHTS_ROOT / "models" / "antelopev2" / "glintr100_pt.pth"
 FACE_PARSING_MODEL_PATH: Final[Path] = _WEIGHTS_ROOT / "face-parsing" / "model.onnx"
 FACE_OCCLUDER_MODEL_DIR: Final[Path] = _WEIGHTS_ROOT / "face-occluder"
 YOLO_MODEL_DIR: Final[Path] = _WEIGHTS_ROOT / "yolo"
@@ -68,35 +73,18 @@ SAM3_CONFIG_PATH: Final[Path] = SAM3_MODEL_DIR / "config.json"
 
 
 class FaceType(IntEnum):
-    HALF = 0
-    MID_FULL = 1
-    FULL = 2
     WHOLE_FACE = 3
     HEAD = 4
 
 
 FACE_TYPE_SCALE: Final[dict[FaceType, float]] = {
-    FaceType.HALF: 1.0,
-    FaceType.MID_FULL: 1.0,
-    FaceType.FULL: 1.15,
-    FaceType.WHOLE_FACE: 1.35,
-    FaceType.HEAD: 2.0,
+    FaceType.WHOLE_FACE: 1.0,
+    FaceType.HEAD: 1.5,
 }
 
-FACE_TYPE_CHIN_OFFSET: Final[dict[FaceType, float]] = {
-    FaceType.HALF: 0.0,
-    FaceType.MID_FULL: 0.0,
-    FaceType.FULL: 0.0,
-    FaceType.WHOLE_FACE: 0.05,
-    FaceType.HEAD: 0.35,
-}
-
-FACE_TYPE_MIN_RESOLUTION: Final[dict[FaceType, int]] = {
-    FaceType.HALF: 64,
-    FaceType.MID_FULL: 64,
-    FaceType.FULL: 96,
-    FaceType.WHOLE_FACE: 128,
-    FaceType.HEAD: 192,
+FACE_TYPE_FOREHEAD_OFFSET: Final[dict[FaceType, float]] = {
+    FaceType.WHOLE_FACE: 0.0,
+    FaceType.HEAD: 0.0,
 }
 
 SUPPORTED_IMAGE_EXTENSIONS: Final[tuple[str, ...]] = (".jpg", ".jpeg", ".png", ".bmp", ".webp")

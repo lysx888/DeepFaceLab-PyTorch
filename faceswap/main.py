@@ -8,7 +8,7 @@ configure_torch("gpu_train")
 import torch
 
 from faceswap.setting import (
-    WORKSPACE_DIR, MODEL_DIR,
+    WORKSPACE_DIR, MODEL_DIR, XSEG_MODEL_DIR,
     DATA_SRC_DIR, DATA_DST_DIR,
     DATA_SRC_ALIGNED_DIR, DATA_DST_ALIGNED_DIR,
     DATA_DST_ALIGNED_DEBUG_DIR,
@@ -195,11 +195,18 @@ def _dispatch(args):
         debug = getattr(args, "debug", False)
 
         gpu_idx = 0
-        if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            gpu_list = ", ".join(f"[{i}] {torch.cuda.get_device_name(i)}" for i in range(gpu_count))
+        from faceswap.shared.config import is_gpu_available
+        if is_gpu_available():
             print(f"\n  [CPU] : CPU")
-            print(f"  {gpu_list}")
+            if torch.cuda.is_available():
+                gpu_count = torch.cuda.device_count()
+                for i in range(gpu_count):
+                    print(f"  [{i}] {torch.cuda.get_device_name(i)} (CUDA)")
+            if hasattr(torch, 'xpu') and torch.xpu.is_available():
+                xpu_count = torch.xpu.device_count()
+                base = torch.cuda.device_count() if torch.cuda.is_available() else 0
+                for i in range(xpu_count):
+                    print(f"  [{base + i}] {torch.xpu.get_device_name(i)} (XPU)")
             try:
                 gpu_input = input(f"\n  Which GPU index to choose? [{gpu_idx}] : ").strip()
             except EOFError:
@@ -337,12 +344,12 @@ def _dispatch(args):
 
     elif cmd == "xseg-train":
         trainer = XSegTrainer()
-        trainer.train(DATA_SRC_ALIGNED_DIR, DATA_DST_ALIGNED_DIR, MODEL_DIR,
+        trainer.train(DATA_SRC_ALIGNED_DIR, DATA_DST_ALIGNED_DIR, XSEG_MODEL_DIR,
                       resolution=args.resolution, batch_size=args.batch_size, epochs=args.epochs)
 
     elif cmd in ("xseg-apply-src", "xseg-apply-dst"):
         d = DATA_SRC_ALIGNED_DIR if "src" in cmd else DATA_DST_ALIGNED_DIR
-        XSegTrainer().apply_trained_mask(d, MODEL_DIR)
+        XSegTrainer().apply_trained_mask(d, XSEG_MODEL_DIR)
 
     elif cmd in ("xseg-remove-trained-src", "xseg-remove-trained-dst"):
         d = DATA_SRC_ALIGNED_DIR if "src" in cmd else DATA_DST_ALIGNED_DIR
