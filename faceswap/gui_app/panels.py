@@ -2960,6 +2960,7 @@ class Step7IFTrain(StepPanel):
         self._train_scrfd = self._add_check("同时训练SCRFD检测器", True)
         self._load_lm_pretrained = self._add_check("加载Landmark预训练权重", True)
         self._load_pretrained = self._add_check("加载SCRFD预训练权重", True)
+        self._fresh_start = self._add_check("从头训练（删除旧保存）", False)
 
         btn_row = QHBoxLayout()
         self._train_btn = QPushButton("开始训练")
@@ -3068,6 +3069,15 @@ class Step7IFTrain(StepPanel):
 
         lm_model_dir = IF_LANDMARK_MODEL_DIR
         lm_model_dir.mkdir(parents=True, exist_ok=True)
+
+        if self._fresh_start.isChecked():
+            import glob as _glob
+            for d in [lm_model_dir, SCRFD_MODEL_DIR]:
+                if d.exists():
+                    for f in d.iterdir():
+                        if f.suffix in ('.pth', '.json', '.txt') or f.name == '.save_complete':
+                            f.unlink()
+            self._log_text.append("已删除旧模型保存，从头开始训练。")
 
         self._train_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
