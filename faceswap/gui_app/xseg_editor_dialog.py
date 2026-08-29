@@ -1057,17 +1057,24 @@ class _ImageLoaderThread(QThread):
     def __init__(self, aligned_dir: Path):
         super().__init__()
         self._aligned_dir = aligned_dir
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
 
     def run(self):
         images = FileManager.find_images(self._aligned_dir)
         total = len(images)
         annotated_count = 0
         for i, img_path in enumerate(images):
+            if self._stop:
+                break
             meta = MetadataManager.load(img_path, lightweight=True)
             if meta is not None and meta.seg_ie_polys is not None:
                 annotated_count += 1
             self.progress.emit(i + 1, total, img_path.name)
-        self.finished_loading.emit(images, annotated_count)
+        if not self._stop:
+            self.finished_loading.emit(images, annotated_count)
 
 
 class XSegEditorDialog(QDialog):
@@ -1109,6 +1116,11 @@ class XSegEditorDialog(QDialog):
         self._loader_thread.progress.connect(self._on_load_progress)
         self._loader_thread.finished_loading.connect(self._on_load_finished)
         self._loader_thread.start()
+
+    def done(self, result):
+        self._loader_thread.stop()
+        self._loader_thread.wait()
+        super().done(result)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

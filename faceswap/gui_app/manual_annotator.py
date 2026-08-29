@@ -779,9 +779,15 @@ class _ThumbLoader(QThread):
         super().__init__()
         self._paths = image_paths
         self._preload_count = preload_count
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
 
     def run(self):
         for i, img_path in enumerate(self._paths):
+            if self._stop:
+                break
             if i < self._preload_count:
                 continue
             img = cv2.imread(str(img_path))
@@ -791,7 +797,8 @@ class _ThumbLoader(QThread):
             rgb = bgr_to_rgb(thumb)
             qimg = QImage(rgb.data, 120, 80, 3 * 120, QImage.Format.Format_RGB888).copy()
             self.thumb_loaded.emit(i, qimg, img_path.stem, str(img_path))
-        self.loading_finished.emit()
+        if not self._stop:
+            self.loading_finished.emit()
 
 
 class ManualAnnotatorDialog(QDialog):
@@ -1627,6 +1634,11 @@ class _FrameSelectDialog(QDialog):
         self.frame_selected.emit(path_str)
         self.accept()
 
+    def done(self, result):
+        self._thumb_loader.stop()
+        self._thumb_loader.wait()
+        super().done(result)
+
 
 class _HorizontalThumbDialog(QDialog):
     thumb_selected = pyqtSignal(int)
@@ -1689,6 +1701,7 @@ class DebugPreviewDialog(QDialog):
         self._current_image_idx = -1
         self._editing = False
         self._saving = False
+        self._thumb_loader = None
         self.setWindowTitle("调试图预览 - " + ("源 (SRC)" if is_src else "目标 (DST)"))
         self.setMinimumSize(1300, 800)
         self.setWindowFlags(self.windowFlags() |
@@ -1697,6 +1710,12 @@ class DebugPreviewDialog(QDialog):
         self._build_ui()
         self._start_loading_thumbnails()
         self.showMaximized()
+
+    def done(self, result):
+        if self._thumb_loader is not None:
+            self._thumb_loader.stop()
+            self._thumb_loader.wait()
+        super().done(result)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
