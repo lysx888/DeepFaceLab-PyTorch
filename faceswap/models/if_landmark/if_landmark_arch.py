@@ -142,27 +142,16 @@ class IFLandmarkNet(nn.Module):
 
     def export_onnx(self, path: str | Path) -> None:
         self.eval()
-        wrapper = _PreprocessWrapper(self).eval()
         device = next(self.parameters()).device
-        dummy = (torch.randn(1, 3, _INPUT_SIZE, _INPUT_SIZE, device=device) * 255.0)
+        dummy = torch.randn(1, 3, _INPUT_SIZE, _INPUT_SIZE, device=device)
         torch.onnx.export(
-            wrapper,
+            self,
             dummy,
             str(path),
             input_names=["data"],
             output_names=["fc1"],
             dynamic_axes={"data": {0: "batch"}, "fc1": {0: "batch"}},
-            opset_version=18,
+            opset_version=12,
             dynamo=False,
         )
         _logger.info(f"ONNX exported: {path}")
-
-
-class _PreprocessWrapper(nn.Module):
-    def __init__(self, net: "IFLandmarkNet"):
-        super().__init__()
-        self.net = net
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = (x - 127.5) / 128.0
-        return self.net(x)
