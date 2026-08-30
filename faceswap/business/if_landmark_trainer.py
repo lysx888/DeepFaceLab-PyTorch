@@ -1,3 +1,4 @@
+import gc
 import threading
 import time
 from collections import deque
@@ -36,6 +37,7 @@ class IFLandmarkTrainer:
         self._loss_history: list[list[float]] = []
         self._if_model: Optional[IFLandmarkModel] = None
         self._epoch_count = 0
+        self._loader: Optional[DataLoader] = None
 
     def _resolve_device(self) -> torch.device:
         if self._device is not None:
@@ -48,6 +50,13 @@ class IFLandmarkTrainer:
 
     def request_stop(self):
         self._stop_event.set()
+        if self._loader is not None:
+            try:
+                it = getattr(self._loader, '_iterator', None)
+                if it is not None:
+                    it._shutdown_workers()
+            except Exception:
+                pass
 
     def request_preview(self):
         self._preview_event.set()
@@ -130,11 +139,17 @@ class IFLandmarkTrainer:
             persistent_workers=n_workers > 0,
             prefetch_factor=dl_cfg.get("prefetch_factor"),
         )
+        self._loader = loader
+        n_batches = len(loader)
 
         last_save_time = time.time()
         smooth_loss = deque(maxlen=100)
 
-        for epoch in range(start_epoch, max_epochs):
+        _logger.info(f"训练参数: max_epochs={max_epochs}, batch_size={batch_size}, lr={learning_rate}, start_epoch={start_epoch}")
+        if start_epoch > 0:
+            _logger.info(f"续训: 从第 {start_epoch} 轮开始，额外训练 {max_epochs} 轮 (到第 {start_epoch + max_epochs} 轮)")
+
+        for epoch in range(start_epoch, start_epoch + max_epochs):
             if self._stop_event.is_set():
                 break
 
@@ -156,6 +171,22 @@ class IFLandmarkTrainer:
                 loss_val = loss.item()
                 epoch_losses.append(loss_val)
                 smooth_loss.append(loss_val)
+
+                if batch_idx % 100 == 0:
+                    try:
+                        import psutil
+                        proc = psutil.Process()
+                        children = proc.children(recursive=True)
+                        child_mem = sum(c.memory_info().rss for c in children)
+                        total_mb = (proc.memory_info().rss + child_mem) / 1024**2
+                        _logger.info(
+                            f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  batch {batch_idx}/{n_batches}  "
+                            f"loss={loss_val:.6f}  lr={optimizer.param_groups[0]['lr']:.6f}  "
+                            f"mem={total_mb:.0f}MB(workers={len(children)})")
+                    except Exception:
+                        _logger.info(
+                            f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  batch {batch_idx}/{n_batches}  "
+                            f"loss={loss_val:.6f}  lr={optimizer.param_groups[0]['lr']:.6f}")
 
                 if self._preview_event.is_set():
                     self._preview_event.clear()
@@ -184,6 +215,12 @@ class IFLandmarkTrainer:
             if self._stop_event.is_set():
                 break
 
+            if self._preview_event.is_set():
+                self._preview_event.clear()
+                if on_preview is not None:
+                    preview_img = self._generate_preview(net, dataset, device)
+                    on_preview(preview_img)
+
             scheduler.step()
             avg_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
             smooth_avg = float(np.mean(smooth_loss)) if smooth_loss else 0.0
@@ -192,10 +229,10 @@ class IFLandmarkTrainer:
 
             current_lr = optimizer.param_groups[0]['lr']
             if on_epoch is not None:
-                on_epoch(epoch + 1, avg_loss, current_lr)
+                on_epoch(epoch + 1 - start_epoch, avg_loss, current_lr)
 
             _logger.info(
-                f"Epoch {epoch + 1}/{max_epochs}  loss={avg_loss:.6f}  "
+                f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  loss={avg_loss:.6f}  "
                 f"smooth={smooth_avg:.6f}  lr={current_lr:.6f}")
 
             if_model.get_aux_state()['iter_count'] = epoch + 1
@@ -213,6 +250,16 @@ class IFLandmarkTrainer:
             except Exception as e:
                 _logger.warning(f"ONNX export failed: {e}")
 
+        try:
+            it = getattr(loader, '_iterator', None)
+            if it is not None:
+                it._shutdown_workers()
+        except Exception:
+            pass
+        self._loader = None
+        gc.collect()
+        time.sleep(1)
+
     def _generate_preview(
         self,
         net: nn.Module,
@@ -220,53 +267,69 @@ class IFLandmarkTrainer:
         device: torch.device,
     ) -> np.ndarray:
         net.eval()
-        n_samples = min(8, len(dataset))
+        n_samples = min(4, len(dataset))
         indices = np.random.choice(len(dataset), n_samples, replace=False)
 
-        cols = 4
-        rows = (n_samples + cols - 1) // cols
-        cell_size = 192
+        cols = n_samples
+        rows = 1
+        cell_size = _INPUT_SIZE
         gap = 4
         canvas_w = cols * (cell_size + gap) + gap
         canvas_h = rows * (cell_size + gap) + gap
         canvas = np.full((canvas_h, canvas_w, 3), 30, dtype=np.uint8)
 
+        from insightface.utils.face_align import estimate_norm
+        _ALIGN_SIZE = 256
+        _KPS5_IDX = [34, 38, 88, 92, 86, 52, 61]
+        _KPS5_GROUPS = [[34, 38], [88, 92], [86], [52], [61]]
+
         with torch.no_grad():
             for i, idx in enumerate(indices):
-                sample = dataset[idx]
-                img_tensor = sample['image'].unsqueeze(0).to(device)
-                pred = net(img_tensor)[0].cpu().numpy()
+                img_path, landmarks, bbox = dataset._samples[idx]
+                img = dataset._read_image(img_path)
+                if img is None:
+                    continue
 
-                img = sample['image'].numpy()
-                img = img.transpose(1, 2, 0)
-                img = (img * 128.0 + 127.5).clip(0, 255).astype(np.uint8)
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                kps5 = np.zeros((5, 2), dtype=np.float32)
+                for ki, grp in enumerate(_KPS5_GROUPS):
+                    kps5[ki] = landmarks[grp].mean(axis=0)
 
-                pred = pred.reshape(_NUM_LANDMARKS, 2)
+                M = estimate_norm(kps5, _ALIGN_SIZE)
+                aligned = cv2.warpAffine(img, M, (_ALIGN_SIZE, _ALIGN_SIZE),
+                                         flags=cv2.INTER_LINEAR, borderValue=0)
+                rs = cell_size / _ALIGN_SIZE
+                aligned = cv2.resize(aligned, (cell_size, cell_size))
+
+                def _tx(pts):
+                    pts = pts.astype(np.float32)
+                    out = np.zeros_like(pts)
+                    out[:, 0] = M[0, 0] * pts[:, 0] + M[0, 1] * pts[:, 1] + M[0, 2]
+                    out[:, 1] = M[1, 0] * pts[:, 0] + M[1, 1] * pts[:, 1] + M[1, 2]
+                    return out * rs
+
+                gt_a = _tx(landmarks)
+
+                inp = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB).astype(np.float32)
+                inp = (inp - 127.5) / 128.0
+                inp_t = torch.from_numpy(inp).permute(2, 0, 1).unsqueeze(0).to(device)
+                pred = net(inp_t)[0].cpu().numpy().reshape(_NUM_LANDMARKS, 2)
                 pred[:, 0] += 1.0
                 pred[:, 1] += 1.0
                 pred *= _HALF_SIZE
 
-                gt = sample['label'].numpy().reshape(_NUM_LANDMARKS, 2)
-                gt[:, 0] += 1.0
-                gt[:, 1] += 1.0
-                gt *= _HALF_SIZE
-
-                vis = img.copy()
                 for j in range(_NUM_LANDMARKS):
                     x, y = int(pred[j, 0]), int(pred[j, 1])
                     if 0 <= x < cell_size and 0 <= y < cell_size:
-                        cv2.circle(vis, (x, y), 1, (0, 255, 0), -1)
+                        cv2.circle(aligned, (x, y), 1, (0, 255, 0), -1)
                 for j in range(_NUM_LANDMARKS):
-                    x, y = int(gt[j, 0]), int(gt[j, 1])
+                    x, y = int(gt_a[j, 0]), int(gt_a[j, 1])
                     if 0 <= x < cell_size and 0 <= y < cell_size:
-                        cv2.circle(vis, (x, y), 1, (0, 0, 255), -1)
+                        cv2.circle(aligned, (x, y), 1, (0, 0, 255), -1)
 
-                row = i // cols
                 col = i % cols
-                y0 = gap + row * (cell_size + gap)
                 x0 = gap + col * (cell_size + gap)
-                canvas[y0:y0 + cell_size, x0:x0 + cell_size] = vis
+                y0 = gap
+                canvas[y0:y0 + cell_size, x0:x0 + cell_size] = aligned
 
         net.train()
         return canvas

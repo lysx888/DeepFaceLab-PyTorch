@@ -1,4 +1,5 @@
 import json
+from collections import OrderedDict
 from pathlib import Path
 
 import cv2
@@ -20,6 +21,7 @@ _logger = get_logger("if_landmark_dataset")
 _INPUT_SIZE = 192
 _NUM_LANDMARKS = 106
 _HALF_SIZE = _INPUT_SIZE // 2
+_IMAGE_CACHE_MAX = 64
 
 _FLIP_PAIRS = [
     (101, 43), (105, 48), (104, 49), (103, 51), (102, 50), (97, 46), (98, 47), (99, 45), (100, 44),
@@ -67,8 +69,8 @@ def _build_augment(augment: bool) -> "A.ReplayCompose":
             A.GaussianBlur(blur_limit=(1, 5), p=0.1),
             A.MotionBlur(blur_limit=(3, 7), p=0.1),
             A.ImageCompression(quality_range=(50, 90), p=0.05),
-            A.ShiftScaleRotate(
-                shift_limit=0.05, scale_limit=0.1, rotate_limit=20,
+            A.Affine(
+                translate_percent=0.05, scale=(0.9, 1.1), rotate=20,
                 interpolation=cv2.INTER_LINEAR,
                 border_mode=cv2.BORDER_CONSTANT, fill=0, fill_mask=0, p=0.5,
             ),
@@ -91,6 +93,7 @@ class IFLandmarkDataset(Dataset):
         self._augment = augment and _HAS_AUG
         self._input_size = input_size
         self._aug = _build_augment(self._augment)
+        self._image_cache: OrderedDict[str, np.ndarray] = OrderedDict()
 
         self._samples: list[tuple[Path, np.ndarray, np.ndarray]] = []
         self._scan()
@@ -127,12 +130,24 @@ class IFLandmarkDataset(Dataset):
                 continue
             self._samples.append((img_path, lm, bbox))
 
+    def _read_image(self, img_path: Path) -> np.ndarray | None:
+        key = str(img_path)
+        if key in self._image_cache:
+            self._image_cache.move_to_end(key)
+            return self._image_cache[key]
+        img = cv2.imread(str(img_path))
+        if img is not None:
+            if len(self._image_cache) >= _IMAGE_CACHE_MAX:
+                self._image_cache.popitem(last=False)
+            self._image_cache[key] = img
+        return img
+
     def __len__(self) -> int:
         return len(self._samples)
 
     def __getitem__(self, index: int) -> dict:
         img_path, landmarks, bbox = self._samples[index]
-        img = cv2.imread(str(img_path))
+        img = self._read_image(img_path)
         if img is None:
             img = np.zeros((self._input_size, self._input_size, 3), dtype=np.uint8)
             landmarks = np.zeros((_NUM_LANDMARKS, 2), dtype=np.float32)

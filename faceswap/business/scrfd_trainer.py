@@ -1,3 +1,4 @@
+import gc
 import threading
 import time
 from collections import deque
@@ -36,6 +37,7 @@ class SCRFDTrainer:
         self._loss_history: list[list[float]] = []
         self._scrfd_model: Optional[SCRFDModel] = None
         self._epoch_count = 0
+        self._loader: Optional[DataLoader] = None
 
     def _resolve_device(self) -> torch.device:
         if self._device is not None:
@@ -48,6 +50,13 @@ class SCRFDTrainer:
 
     def request_stop(self):
         self._stop_event.set()
+        if self._loader is not None:
+            try:
+                it = getattr(self._loader, '_iterator', None)
+                if it is not None:
+                    it._shutdown_workers()
+            except Exception:
+                pass
 
     def request_preview(self):
         self._preview_event.set()
@@ -80,6 +89,7 @@ class SCRFDTrainer:
             augment=augment,
             input_size=_INPUT_SIZE,
             data_dir=str(data_dir),
+            pretrained_onnx=pretrained_onnx or '',
         )
 
         configure_torch("gpu_train" if is_gpu_device(device) else "cpu_train")
@@ -129,11 +139,13 @@ class SCRFDTrainer:
             persistent_workers=n_workers > 0,
             prefetch_factor=dl_cfg.get("prefetch_factor"),
         )
+        self._loader = loader
+        n_batches = len(loader)
 
-        warmup_iters = config.warmup_iters
+        warmup_iters = min(config.warmup_iters, len(dataset) * max_epochs // (batch_size * 3))
         warmup_ratio = config.warmup_ratio
         base_lr = learning_rate
-        global_iter = 0
+        global_iter = start_epoch * len(loader)
 
         last_save_time = time.time()
         smooth_loss = deque(maxlen=100)
@@ -176,7 +188,11 @@ class SCRFDTrainer:
                 lr=base_lr, momentum=0.9, weight_decay=0.0005,
             )
 
-        for epoch in range(start_epoch, max_epochs):
+        _logger.info(f"训练参数: max_epochs={max_epochs}, batch_size={batch_size}, lr={learning_rate}, start_epoch={start_epoch}")
+        if start_epoch > 0:
+            _logger.info(f"续训: 从第 {start_epoch} 轮开始，额外训练 {max_epochs} 轮 (到第 {start_epoch + max_epochs} 轮)")
+
+        for epoch in range(start_epoch, start_epoch + max_epochs):
             if self._stop_event.is_set():
                 break
 
@@ -213,12 +229,29 @@ class SCRFDTrainer:
                                  gt_bboxes, gt_labels, gt_keypointss)
                 loss = losses['loss']
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=10.0)
                 optimizer.step()
 
                 global_iter += 1
                 loss_val = loss.item()
                 epoch_losses.append(loss_val)
                 smooth_loss.append(loss_val)
+
+                if batch_idx % 100 == 0:
+                    try:
+                        import psutil
+                        proc = psutil.Process()
+                        children = proc.children(recursive=True)
+                        child_mem = sum(c.memory_info().rss for c in children)
+                        total_mb = (proc.memory_info().rss + child_mem) / 1024**2
+                        _logger.info(
+                            f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  batch {batch_idx}/{n_batches}  "
+                            f"loss={loss_val:.6f}  lr={optimizer.param_groups[-1]['lr']:.6f}  "
+                            f"mem={total_mb:.0f}MB(workers={len(children)})")
+                    except Exception:
+                        _logger.info(
+                            f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  batch {batch_idx}/{n_batches}  "
+                            f"loss={loss_val:.6f}  lr={optimizer.param_groups[-1]['lr']:.6f}")
 
                 if self._preview_event.is_set():
                     self._preview_event.clear()
@@ -252,12 +285,12 @@ class SCRFDTrainer:
             self._loss_history.append([epoch, avg_loss])
             self._epoch_count = epoch + 1
 
-            current_lr = optimizer.param_groups[0]['lr']
+            current_lr = optimizer.param_groups[-1]['lr']
             if on_epoch is not None:
-                on_epoch(epoch + 1, avg_loss, current_lr)
+                on_epoch(epoch + 1 - start_epoch, avg_loss, current_lr)
 
             _logger.info(
-                f"Epoch {epoch + 1}/{max_epochs}  loss={avg_loss:.6f}  "
+                f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  loss={avg_loss:.6f}  "
                 f"smooth={smooth_avg:.6f}  lr={current_lr:.6f}")
 
             scrfd_model.get_aux_state()['iter_count'] = epoch + 1
@@ -275,6 +308,16 @@ class SCRFDTrainer:
             except Exception as e:
                 _logger.warning(f"ONNX export failed: {e}")
 
+        try:
+            it = getattr(loader, '_iterator', None)
+            if it is not None:
+                it._shutdown_workers()
+        except Exception:
+            pass
+        self._loader = None
+        gc.collect()
+        time.sleep(1)
+
     def _generate_preview(
         self,
         net: SCRFDNet,
@@ -285,51 +328,81 @@ class SCRFDTrainer:
         n_samples = min(4, len(dataset))
         indices = np.random.choice(len(dataset), n_samples, replace=False)
 
-        cell_size = _INPUT_SIZE
+        _PREVIEW_SIZE = 320
+        cell_size = _PREVIEW_SIZE
         gap = 4
-        cols = 2
-        rows = (n_samples + cols - 1) // cols
+        cols = n_samples
+        rows = 1
         canvas_w = cols * (cell_size + gap) + gap
         canvas_h = rows * (cell_size + gap) + gap
         canvas = np.full((canvas_h, canvas_w, 3), 30, dtype=np.uint8)
 
         with torch.no_grad():
             for i, idx in enumerate(indices):
-                sample = dataset[idx]
-                img_tensor = sample['image'].unsqueeze(0).to(device)
+                img_path, bbox, kps = dataset._samples[idx]
+                img = dataset._read_image(img_path)
+                if img is None:
+                    continue
 
-                img = sample['image'].numpy().transpose(1, 2, 0)
-                img = (img * 128.0 + 127.5).clip(0, 255).astype(np.uint8)
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                h, w = img.shape[:2]
+                gx1, gy1, gx2, gy2 = bbox
+                cx = (gx1 + gx2) / 2.0
+                cy = (gy1 + gy2) / 2.0
+                fs = int(max(gx2 - gx1, gy2 - gy1, 20) * 1.4)
+                half = int(fs / 2)
+                x_lo = int(cx) - half
+                y_lo = int(cy) - half
+                x_hi = x_lo + fs
+                y_hi = y_lo + fs
+                sx = max(0, x_lo)
+                sy = max(0, y_lo)
+                ex = min(w, x_hi)
+                ey = min(h, y_hi)
+                crop = img[sy:ey, sx:ex].copy()
+                pad_l = sx - x_lo
+                pad_t = sy - y_lo
+                pad_r = x_hi - ex
+                pad_b = y_hi - ey
+                if pad_l or pad_t or pad_r or pad_b:
+                    crop = cv2.copyMakeBorder(crop, pad_t, pad_b, pad_l, pad_r,
+                                             cv2.BORDER_CONSTANT, value=0)
+                display = cv2.resize(crop, (cell_size, cell_size))
+                padded = display
 
-                gt_bboxes = sample['gt_bboxes'].numpy()
-                gt_kps = sample['gt_keypointss'].numpy()
+                def _to_preview(pts_xy):
+                    pts_xy = np.asarray(pts_xy, dtype=np.float32).copy()
+                    pts_xy[:, 0] = (pts_xy[:, 0] - x_lo) * (cell_size / fs)
+                    pts_xy[:, 1] = (pts_xy[:, 1] - y_lo) * (cell_size / fs)
+                    return pts_xy
 
-                for j in range(len(gt_bboxes)):
-                    x1, y1, x2, y2 = gt_bboxes[j].astype(int)
-                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    for k in range(5):
-                        px, py = int(gt_kps[j, k, 0]), int(gt_kps[j, k, 1])
-                        cv2.circle(img, (px, py), 3, (0, 255, 0), -1)
+                gt_bb = _to_preview([[gx1, gy1], [gx2, gy2]])
+                cv2.rectangle(padded, (int(gt_bb[0, 0]), int(gt_bb[0, 1])),
+                              (int(gt_bb[1, 0]), int(gt_bb[1, 1])), (0, 255, 0), 2)
+                gt_kps = _to_preview(kps)
+                for k in range(5):
+                    cv2.circle(padded, (int(gt_kps[k, 0]), int(gt_kps[k, 1])), 3, (0, 255, 0), -1)
 
                 dets, kpss = scrfd_detect(net, img, input_size=_INPUT_SIZE,
                                          det_thresh=0.5, nms_thresh=0.4)
                 for j in range(len(dets)):
                     x1, y1, x2, y2, score = dets[j]
-                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                    cv2.putText(img, f"{score:.2f}", (x1, y1 - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                    if x2 < x_lo or x1 > x_hi or y2 < y_lo or y1 > y_hi:
+                        continue
+                    det_bb = _to_preview([[x1, y1], [x2, y2]])
+                    cv2.rectangle(padded, (int(det_bb[0, 0]), int(det_bb[0, 1])),
+                                  (int(det_bb[1, 0]), int(det_bb[1, 1])), (0, 0, 255), 2)
+                    cv2.putText(padded, f"{score:.2f}", (int(det_bb[0, 0]), max(int(det_bb[0, 1]) - 5, 0)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
                     if j < len(kpss):
+                        det_kps = _to_preview(kpss[j])
                         for k in range(5):
-                            px, py = int(kpss[j, k, 0]), int(kpss[j, k, 1])
-                            cv2.circle(img, (px, py), 3, (0, 0, 255), -1)
+                            cv2.circle(padded, (int(det_kps[k, 0]), int(det_kps[k, 1])),
+                                       3, (0, 0, 255), -1)
 
-                row = i // cols
                 col = i % cols
-                y0 = gap + row * (cell_size + gap)
                 x0 = gap + col * (cell_size + gap)
-                canvas[y0:y0 + cell_size, x0:x0 + cell_size] = img
+                y0 = gap
+                canvas[y0:y0 + cell_size, x0:x0 + cell_size] = padded
 
         net.train()
         return canvas

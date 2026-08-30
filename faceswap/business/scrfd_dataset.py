@@ -1,5 +1,6 @@
 import json
 import random
+from collections import OrderedDict
 from pathlib import Path
 
 import cv2
@@ -16,6 +17,7 @@ _INPUT_SIZE = 640
 _NUM_KPS = 5
 _KPS_FLIP_ORDER = [1, 0, 2, 4, 3]
 _CROP_CHOICES = [0.3, 0.45, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+_IMAGE_CACHE_MAX = 64
 
 
 def _random_square_crop(img, bboxes, keypointss, crop_choices=_CROP_CHOICES):
@@ -150,6 +152,7 @@ class SCRFDDataset(Dataset):
         self._data_dir = Path(data_dir)
         self._augment = augment
         self._input_size = input_size
+        self._image_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._samples: list[tuple[Path, np.ndarray, np.ndarray]] = []
         self._scan()
 
@@ -185,12 +188,24 @@ class SCRFDDataset(Dataset):
                 continue
             self._samples.append((img_path, bbox, kps))
 
+    def _read_image(self, img_path: Path) -> np.ndarray | None:
+        key = str(img_path)
+        if key in self._image_cache:
+            self._image_cache.move_to_end(key)
+            return self._image_cache[key]
+        img = cv2.imread(str(img_path))
+        if img is not None:
+            if len(self._image_cache) >= _IMAGE_CACHE_MAX:
+                self._image_cache.popitem(last=False)
+            self._image_cache[key] = img
+        return img
+
     def __len__(self) -> int:
         return len(self._samples)
 
     def __getitem__(self, index: int) -> dict:
         img_path, bbox, kps = self._samples[index]
-        img = cv2.imread(str(img_path))
+        img = self._read_image(img_path)
         if img is None:
             img = np.zeros((self._input_size, self._input_size, 3), dtype=np.uint8)
             bbox = np.array([0, 0, self._input_size, self._input_size], dtype=np.float32)
