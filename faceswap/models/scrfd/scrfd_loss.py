@@ -251,7 +251,7 @@ class SCRFDLoss(nn.Module):
     def __init__(self, input_size=640, feat_strides=_FEAT_STRIDES,
                  num_anchors=_NUM_ANCHORS, num_classes=1, num_kps=_NUM_KPS,
                  topk=9, beta_qfl=2.0, bbox_loss_weight=2.0,
-                 kps_loss_weight=0.1, kps_beta=1.0 / 9.0):
+                 kps_loss_weight=0.1, kps_beta=1.0 / 9.0, use_qscore=False):
         super().__init__()
         self.input_size = input_size
         self.feat_strides = list(feat_strides)
@@ -262,6 +262,7 @@ class SCRFDLoss(nn.Module):
         self.bbox_loss_weight = bbox_loss_weight
         self.kps_loss_weight = kps_loss_weight
         self.kps_beta = kps_beta
+        self.use_qscore = use_qscore
         self.assigner = ATSSAssigner(topk=topk)
         self._anchor_list = None
         self._num_per_level = None
@@ -358,8 +359,11 @@ class SCRFDLoss(nn.Module):
                     pos_decode_bbox_targets = pos_bbox_targets / stride
                     pos_decode_bbox_pred = distance2bbox(pos_anchor_centers, pos_bbox_pred.clamp(min=0))
 
-                    score[pos] = bbox_overlaps(
-                        pos_decode_bbox_pred.detach(), pos_decode_bbox_targets, is_aligned=True)
+                    if self.use_qscore:
+                        score[pos] = bbox_overlaps(
+                            pos_decode_bbox_pred.detach(), pos_decode_bbox_targets, is_aligned=True)
+                    else:
+                        score[pos] = 1.0
 
                     loss_bbox = self.bbox_loss_weight * diou_loss(
                         pos_decode_bbox_pred, pos_decode_bbox_targets)
