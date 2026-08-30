@@ -32,7 +32,7 @@ def generate_anchors(input_size, strides=_FEAT_STRIDES, num_anchors=_NUM_ANCHORS
                 centers[:, 0:1] + half, centers[:, 1:2] + half,
             ], dim=1)
             anchors_per_level.append(a)
-        anchors = torch.cat(anchors_per_level, dim=0)
+        anchors = torch.stack(anchors_per_level, dim=1).reshape(-1, 4)
         all_anchors.append(anchors)
         num_per_level.append(anchors.shape[0])
     return all_anchors, num_per_level
@@ -59,7 +59,7 @@ def generate_anchors_fast(input_size, strides=_FEAT_STRIDES, num_anchors=_NUM_AN
                 centers[:, 0:1] + half, centers[:, 1:2] + half,
             ], dim=1)
             anchors_per_level.append(a)
-        anchors = torch.cat(anchors_per_level, dim=0)
+        anchors = torch.stack(anchors_per_level, dim=1).reshape(-1, 4)
         all_anchors.append(anchors)
         num_per_level.append(anchors.shape[0])
     return all_anchors, num_per_level
@@ -251,7 +251,7 @@ class SCRFDLoss(nn.Module):
     def __init__(self, input_size=640, feat_strides=_FEAT_STRIDES,
                  num_anchors=_NUM_ANCHORS, num_classes=1, num_kps=_NUM_KPS,
                  topk=9, beta_qfl=2.0, bbox_loss_weight=2.0,
-                 kps_loss_weight=0.1, kps_beta=1.0 / 9.0, use_qscore=False):
+                 kps_loss_weight=0.1, kps_beta=1.0 / 9.0, use_qscore=True):
         super().__init__()
         self.input_size = input_size
         self.feat_strides = list(feat_strides)
@@ -286,6 +286,7 @@ class SCRFDLoss(nn.Module):
         total_loss_bbox = 0.0
         total_loss_kps = 0.0
         total_pos = 0.0
+        batch_total_pos = 0
 
         for img_id in range(num_imgs):
             gt_bboxes = gt_bboxes_list[img_id]
@@ -293,11 +294,12 @@ class SCRFDLoss(nn.Module):
             gt_keypointss = gt_keypointss_list[img_id]
 
             if gt_bboxes.numel() == 0:
+                batch_total_pos += 1
                 for lvl in range(num_levels):
                     cs = cls_scores[lvl][img_id].permute(1, 2, 0).reshape(-1, self.num_classes)
                     score = cs.new_zeros(cs.shape[0])
                     loss_cls = quality_focal_loss(cs, cs.new_full(cs.shape[0], self.num_classes, dtype=torch.long), score, beta=self.beta_qfl)
-                    total_loss_cls = total_loss_cls + loss_cls.mean()
+                    total_loss_cls = total_loss_cls + loss_cls.sum()
                 continue
 
             flat_anchors = torch.cat(anchor_list)
@@ -305,7 +307,7 @@ class SCRFDLoss(nn.Module):
                 flat_anchors, num_per_level, gt_bboxes, gt_labels)
 
             num_total_pos = (assigned_gt_inds > 0).sum().item()
-            num_total_pos = max(num_total_pos, 1)
+            batch_total_pos += max(num_total_pos, 1)
 
             bbox_targets = torch.zeros_like(flat_anchors)
             labels = flat_anchors.new_full((flat_anchors.size(0),), self.num_classes, dtype=torch.long)
@@ -357,7 +359,7 @@ class SCRFDLoss(nn.Module):
                     weight_targets = cs.detach().sigmoid()
                     weight_targets = weight_targets.max(dim=1)[0][pos]
                     pos_decode_bbox_targets = pos_bbox_targets / stride
-                    pos_decode_bbox_pred = distance2bbox(pos_anchor_centers, pos_bbox_pred.clamp(min=0))
+                    pos_decode_bbox_pred = distance2bbox(pos_anchor_centers, pos_bbox_pred)
 
                     if self.use_qscore:
                         score[pos] = bbox_overlaps(
@@ -388,13 +390,15 @@ class SCRFDLoss(nn.Module):
 
                 loss_cls = quality_focal_loss(
                     cs, lvl_labels, score, beta=self.beta_qfl)
-                loss_cls = (loss_cls * lvl_label_weights).sum() / num_total_pos
+                loss_cls = (loss_cls * lvl_label_weights).sum()
 
                 total_loss_cls = total_loss_cls + loss_cls
                 total_loss_bbox = total_loss_bbox + loss_bbox
                 total_loss_kps = total_loss_kps + loss_kps
                 total_pos += weight_targets.sum().item() if len(pos) > 0 else 0.0
 
+        batch_total_pos = max(batch_total_pos, 1)
+        total_loss_cls = total_loss_cls / batch_total_pos
         total_pos = max(total_pos, 1.0)
         total_loss_bbox = total_loss_bbox / total_pos
         total_loss_kps = total_loss_kps / total_pos

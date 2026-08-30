@@ -23,6 +23,7 @@ class SCRFDTrainingConfig:
         self.warmup_iters = kwargs.get('warmup_iters', 1500)
         self.warmup_ratio = kwargs.get('warmup_ratio', 0.001)
         self.lr_step_epochs = kwargs.get('lr_step_epochs', [20, 27])
+        self.pretrained_onnx = kwargs.get('pretrained_onnx', '')
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
@@ -47,11 +48,11 @@ class SCRFDModel(BaseModel):
         "warmup_iters": "预热迭代数",
         "warmup_ratio": "预热比例",
         "lr_step_epochs": "学习率衰减轮次",
+        "pretrained_onnx": "预训练ONNX路径",
     }
 
     def __init__(self, config: SCRFDTrainingConfig, model_dir: Path, device: torch.device):
         self.scrfd_net: nn.Module | None = None
-        self._scheduler = None
         super().__init__(config, model_dir, device)
 
     def build(self) -> None:
@@ -82,17 +83,8 @@ class SCRFDModel(BaseModel):
         )
         self.register_optimizer('scrfd_opt', optimizer)
 
-        def lr_step_func(epoch: int) -> float:
-            return 0.1 ** len([m for m in self.config.lr_step_epochs if m <= epoch])
-
-        self._scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer=optimizer, lr_lambda=lr_step_func)
-
     def try_load(self) -> None:
         super().try_load()
-        if self._scheduler is not None:
-            epoch = self._aux_state.get('iter_count', 0)
-            self._scheduler.last_epoch = epoch
 
     def export_onnx(self, path: str | Path) -> None:
         self.scrfd_net.export_onnx(str(path), input_size=self.config.input_size)

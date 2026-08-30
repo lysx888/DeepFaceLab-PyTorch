@@ -88,6 +88,10 @@ class ResNetV1e(nn.Module):
             self.res_layers.append(layer)
             inplanes = planes
 
+        for m in self.modules():
+            if isinstance(m, BasicBlock):
+                nn.init.constant_(m.bn2.weight, 0)
+
     def forward(self, x):
         x = self.stem(x)
         x = self.maxpool(x)
@@ -191,6 +195,18 @@ class SCRFDHead(nn.Module):
             self.kps_preds.append(nn.Conv2d(feat_channels, num_kps * 2 * num_anchors, 3, padding=1))
             self.scales.append(Scale(1.0))
 
+        _bias_cls = -math.log((1 - 0.01) / 0.01)
+        for cls_convs in self.cls_convs:
+            for m in cls_convs:
+                nn.init.normal_(m.conv.weight, std=0.01)
+        for conv in self.cls_preds:
+            nn.init.normal_(conv.weight, std=0.01)
+            nn.init.constant_(conv.bias, _bias_cls)
+        for conv in self.reg_preds:
+            nn.init.normal_(conv.weight, std=0.01)
+        for conv in self.kps_preds:
+            nn.init.normal_(conv.weight, std=0.01)
+
     def forward(self, feats):
         cls_scores = []
         bbox_preds = []
@@ -202,7 +218,7 @@ class SCRFDHead(nn.Module):
             reg_feat = cls_feat
 
             cls_score = self.cls_preds[i](cls_feat)
-            bbox_pred = self.scales[i](self.reg_preds[i](reg_feat)).clamp(min=0)
+            bbox_pred = self.scales[i](self.reg_preds[i](reg_feat))
             kps_pred = self.kps_preds[i](reg_feat)
 
             cls_scores.append(cls_score)
@@ -405,7 +421,7 @@ class SCRFDNet(nn.Module):
         torch.onnx.export(
             wrapper, dummy, path,
             input_names=["input.1"],
-            output_names=[str(i) for i in range(9)],
+            output_names=[f"output_{i}" for i in range(9)],
             opset_version=18,
             external_data=False,
             dynamic_axes={
