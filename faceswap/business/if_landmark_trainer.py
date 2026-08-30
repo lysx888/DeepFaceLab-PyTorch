@@ -240,6 +240,7 @@ class IFLandmarkTrainer:
                 img = sample['image'].numpy()
                 img = img.transpose(1, 2, 0)
                 img = (img * 128.0 + 127.5).clip(0, 255).astype(np.uint8)
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
                 pred = pred.reshape(_NUM_LANDMARKS, 2)
                 pred[:, 0] += 1.0

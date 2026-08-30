@@ -39,31 +39,15 @@ for _a, _b in _FLIP_PAIRS:
 FLIP_MAP_106 = np.array(FLIP_MAP_106, dtype=np.int64)
 
 
-def _get_3rd_point(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    direct = a - b
-    return b + np.array([-direct[1], direct[0]], dtype=np.float32)
-
-
-def _get_affine_transform(
+def _get_similar_transform(
     center: np.ndarray,
     scale: float,
     output_size: int,
 ) -> np.ndarray:
-    scale_tmp = np.array([scale, scale], dtype=np.float32) * 200.0
-    src_w = scale_tmp[0]
-    dst_w = output_size
-    dst_h = output_size
-    src_dir = np.array([0.0, src_w * -0.5], dtype=np.float32)
-    dst_dir = np.array([0.0, dst_w * -0.5], dtype=np.float32)
-    src = np.zeros((3, 2), dtype=np.float32)
-    dst = np.zeros((3, 2), dtype=np.float32)
-    src[0, :] = center
-    src[1, :] = center + src_dir
-    dst[0, :] = [dst_w * 0.5, dst_h * 0.5]
-    dst[1, :] = np.array([dst_w * 0.5, dst_h * 0.5]) + dst_dir
-    src[2:, :] = _get_3rd_point(src[0, :], src[1, :])
-    dst[2:, :] = _get_3rd_point(dst[0, :], dst[1, :])
-    return cv2.getAffineTransform(src, dst)
+    return np.array([
+        [scale, 0.0, output_size / 2.0 - center[0] * scale],
+        [0.0, scale, output_size / 2.0 - center[1] * scale],
+    ], dtype=np.float32)
 
 
 def _trans_points(pts: np.ndarray, M: np.ndarray) -> np.ndarray:
@@ -157,7 +141,7 @@ class IFLandmarkDataset(Dataset):
             h = bbox[3] - bbox[1]
             center = np.array([(bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2], dtype=np.float32)
             scale = self._input_size / (max(w, h) * 1.5)
-            M = _get_affine_transform(center, scale, self._input_size)
+            M = _get_similar_transform(center, scale, self._input_size)
             img = cv2.warpAffine(img, M, (self._input_size, self._input_size),
                                  flags=cv2.INTER_LINEAR, borderValue=0)
             landmarks = _trans_points(landmarks.copy(), M)
@@ -176,6 +160,7 @@ class IFLandmarkDataset(Dataset):
         if flipped:
             landmarks = landmarks[FLIP_MAP_106, :]
 
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = img.astype(np.float32)
         img = (img - 127.5) / 128.0
         img = torch.from_numpy(img).permute(2, 0, 1)

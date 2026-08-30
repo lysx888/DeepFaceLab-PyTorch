@@ -205,15 +205,19 @@ class SCRFDDataset(Dataset):
             img, bboxes, keypointss = _random_square_crop(img, bboxes, keypointss)
 
         crop_h, crop_w = img.shape[:2]
-        img = cv2.resize(img, (self._input_size, self._input_size))
-        scale_x = self._input_size / crop_w
-        scale_y = self._input_size / crop_h
-        bboxes[:, 0] *= scale_x
-        bboxes[:, 1] *= scale_y
-        bboxes[:, 2] *= scale_x
-        bboxes[:, 3] *= scale_y
-        keypointss[:, :, 0] *= scale_x
-        keypointss[:, :, 1] *= scale_y
+        scale = self._input_size / max(crop_h, crop_w)
+        new_w = int(crop_w * scale)
+        new_h = int(crop_h * scale)
+        img = cv2.resize(img, (new_w, new_h))
+        padded = np.zeros((self._input_size, self._input_size, 3), dtype=img.dtype)
+        padded[:new_h, :new_w] = img
+        img = padded
+        bboxes[:, 0] *= scale
+        bboxes[:, 1] *= scale
+        bboxes[:, 2] *= scale
+        bboxes[:, 3] *= scale
+        keypointss[:, :, 0] *= scale
+        keypointss[:, :, 1] *= scale
 
         if self._augment:
             img, bboxes, keypointss, _ = _random_flip(img, bboxes, keypointss)

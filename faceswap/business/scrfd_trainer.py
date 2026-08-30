@@ -88,18 +88,21 @@ class SCRFDTrainer:
         self._scrfd_model = scrfd_model
         net = scrfd_model.scrfd_net
 
-        if pretrained_onnx and not scrfd_model.get_aux_state().get('iter_count', 0):
-            try:
-                net.load_pretrained_onnx(pretrained_onnx)
-            except Exception as e:
-                _logger.warning(f"Failed to load pretrained ONNX: {e}")
-        optimizer = scrfd_model.get_optimizers_dict()['scrfd_opt']
-        scheduler = scrfd_model._scheduler
-
         start_epoch = scrfd_model.get_aux_state().get('iter_count', 0)
         restored_loss = scrfd_model.get_aux_state().get('loss_history', [])
         if restored_loss:
             self._loss_history = restored_loss
+
+        is_finetune = False
+        if pretrained_onnx and not start_epoch:
+            try:
+                net.load_pretrained_onnx(pretrained_onnx)
+                is_finetune = True
+            except Exception as e:
+                _logger.warning(f"Failed to load pretrained ONNX: {e}")
+        if start_epoch > 0:
+            is_finetune = scrfd_model.get_aux_state().get('is_finetune', False)
+        scrfd_model.get_aux_state()['is_finetune'] = is_finetune
 
         loss_fn = SCRFDLoss(input_size=_INPUT_SIZE).to(device)
 
@@ -135,11 +138,59 @@ class SCRFDTrainer:
         last_save_time = time.time()
         smooth_loss = deque(maxlen=100)
 
+        if is_finetune:
+            for m in net.modules():
+                if isinstance(m, nn.BatchNorm2d):
+                    m.weight.requires_grad = False
+                    m.bias.requires_grad = False
+            _logger.info("Finetune: BN frozen (identity), all other layers trainable with layerwise lr")
+
+            groups = {'backbone': [], 'neck': [], 'convs': [], 'preds': []}
+            for name, param in net.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if 'backbone' in name:
+                    groups['backbone'].append(param)
+                elif 'neck' in name:
+                    groups['neck'].append(param)
+                elif 'convs' in name:
+                    groups['convs'].append(param)
+                else:
+                    groups['preds'].append(param)
+
+            lr_mults = {'backbone': 0.01, 'neck': 0.05, 'convs': 0.1, 'preds': 1.0}
+            param_groups = []
+            for key in ['backbone', 'neck', 'convs', 'preds']:
+                if groups[key]:
+                    param_groups.append({
+                        'params': groups[key],
+                        'lr': base_lr * lr_mults[key],
+                        'lr_mult': lr_mults[key],
+                    })
+                    _logger.info(f"  {key}: {len(groups[key])} params, lr_mult={lr_mults[key]}")
+            optimizer = torch.optim.SGD(param_groups, momentum=0.9, weight_decay=0.0005)
+        else:
+            _logger.info("From-scratch: all layers trainable with uniform lr")
+            optimizer = torch.optim.SGD(
+                net.parameters(),
+                lr=base_lr, momentum=0.9, weight_decay=0.0005,
+            )
+
         for epoch in range(start_epoch, max_epochs):
             if self._stop_event.is_set():
                 break
 
+            if global_iter >= warmup_iters:
+                decay = 0.1 ** len([m for m in config.lr_step_epochs if m <= epoch])
+                for pg in optimizer.param_groups:
+                    lr_mult = pg.get('lr_mult', 1.0)
+                    pg['lr'] = base_lr * lr_mult * decay
+
             net.train()
+            if is_finetune:
+                for m in net.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        m.eval()
             epoch_losses = []
             for batch_idx, batch in enumerate(loader):
                 if self._stop_event.is_set():
@@ -151,9 +202,10 @@ class SCRFDTrainer:
                 gt_keypointss = [k.to(device) for k in batch['gt_keypointss']]
 
                 if global_iter < warmup_iters:
-                    warmup_lr = base_lr * (warmup_ratio + (1 - warmup_ratio) * global_iter / warmup_iters)
+                    warmup_factor = (warmup_ratio + (1 - warmup_ratio) * global_iter / warmup_iters)
                     for pg in optimizer.param_groups:
-                        pg['lr'] = warmup_lr
+                        lr_mult = pg.get('lr_mult', 1.0)
+                        pg['lr'] = base_lr * lr_mult * warmup_factor
 
                 optimizer.zero_grad()
                 cls_scores, bbox_preds, kps_preds = net(images)
@@ -195,7 +247,6 @@ class SCRFDTrainer:
             if self._stop_event.is_set():
                 break
 
-            scheduler.step()
             avg_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
             smooth_avg = float(np.mean(smooth_loss)) if smooth_loss else 0.0
             self._loss_history.append([epoch, avg_loss])
