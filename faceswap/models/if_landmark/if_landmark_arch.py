@@ -151,7 +151,7 @@ class IFLandmarkNet(nn.Module):
             input_names=["data"],
             output_names=["fc1"],
             dynamic_axes={"data": {0: "batch"}, "fc1": {0: "batch"}},
-            opset_version=12,
+            opset_version=18,
             dynamo=False,
         )
         _logger.info(f"ONNX exported: {path}")
