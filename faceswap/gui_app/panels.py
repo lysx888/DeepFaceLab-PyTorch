@@ -9,7 +9,7 @@ from typing import Optional
 
 import numpy as np
 
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSize
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QRadioButton, QLineEdit,
@@ -30,13 +30,42 @@ from faceswap.setting import (
     DATA_SRC_ALIGNED_DIR, DATA_DST_ALIGNED_DIR,
     DATA_DST_SWAPPED_DIR, DATA_DST_MERGED_DIR, DATA_DST_MERGED_MASK_DIR,
     IF_LANDMARK_MODEL_DIR, INSIGHTFACE_MANUAL_ANNOTATED_DIR,
-    SCRFD_MODEL_DIR,
+    SCRFD_MODEL_DIR, PRETRAIN_DATA_DIR,
     FaceType,
 )
 
 
 class _PreviewSignal(QObject):
     preview_ready = pyqtSignal(np.ndarray)
+
+
+class AutoScaleLabel(QLabel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._raw_pixmap = None
+
+    def setRawPixmap(self, pixmap):
+        self._raw_pixmap = pixmap
+        self._update_scaled()
+
+    def _update_scaled(self):
+        if self._raw_pixmap is None:
+            return
+        lw = self.width()
+        lh = self.height()
+        if lw > 10 and lh > 10:
+            scaled = self._raw_pixmap.scaled(
+                QSize(lw, lh),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            super().setPixmap(scaled)
+        else:
+            super().setPixmap(self._raw_pixmap)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_scaled()
 
 
 class _LogSignal(QObject):
@@ -2948,95 +2977,205 @@ class Step6Output(StepPanel):
 
 class Step7IFTrain(StepPanel):
     step_title = "7. IF训练"
-    step_desc = ("同时训练SCRFD检测器和106点landmark模型，导出ONNX替换insightface预训练权重。\n"
-                 "默认学习率0.001适合微调（勾选预训练权重）。从零训练时请调大至0.1。")
+    step_desc = "先训练SCRFD检测器，再训练106点landmark模型。导出ONNX替换insightface预训练权重。"
     show_run_buttons = False
 
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(8)
+
+        title = QLabel(self.step_title)
+        title.setObjectName("stepTitle")
+        layout.addWidget(title)
+
+        desc = QLabel(self.step_desc)
+        desc.setObjectName("stepDesc")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        main_row = QHBoxLayout()
+        main_row.setSpacing(12)
+
+        left_widget = QWidget()
+        left_widget.setFixedWidth(250)
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+        self._params_area = left_layout
+        self._build_params()
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(4)
+
+        from PyQt6.QtWidgets import QSizePolicy
+        preview_policy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        chart_policy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+        scrfd_title = QLabel("SCRFD检测预览:")
+        scrfd_title.setStyleSheet("font-size: 12px; font-weight: bold;")
+        right_layout.addWidget(scrfd_title)
+        self._scrfd_preview_label = AutoScaleLabel("等待训练...")
+        self._scrfd_preview_label.setMinimumHeight(200)
+        self._scrfd_preview_label.setMinimumWidth(200)
+        self._scrfd_preview_label.setStyleSheet("border: 1px solid #ccc; background-color: #1e1e1e; color: #888;")
+        self._scrfd_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._scrfd_preview_label.setSizePolicy(preview_policy)
+        right_layout.addWidget(self._scrfd_preview_label)
+        self._scrfd_chart_label = AutoScaleLabel()
+        self._scrfd_chart_label.setFixedHeight(120)
+        self._scrfd_chart_label.setMinimumWidth(200)
+        self._scrfd_chart_label.setStyleSheet("border: 1px solid #ccc; background-color: #1e1e1e;")
+        self._scrfd_chart_label.setSizePolicy(chart_policy)
+        right_layout.addWidget(self._scrfd_chart_label)
+
+        lm_title = QLabel("Landmark预览:")
+        lm_title.setStyleSheet("font-size: 12px; font-weight: bold; margin-top: 4px;")
+        right_layout.addWidget(lm_title)
+        self._lm_preview_label = AutoScaleLabel("等待训练...")
+        self._lm_preview_label.setMinimumHeight(200)
+        self._lm_preview_label.setMinimumWidth(200)
+        self._lm_preview_label.setStyleSheet("border: 1px solid #ccc; background-color: #1e1e1e; color: #888;")
+        self._lm_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lm_preview_label.setSizePolicy(preview_policy)
+        right_layout.addWidget(self._lm_preview_label)
+        self._lm_chart_label = AutoScaleLabel()
+        self._lm_chart_label.setFixedHeight(120)
+        self._lm_chart_label.setMinimumWidth(200)
+        self._lm_chart_label.setStyleSheet("border: 1px solid #ccc; background-color: #1e1e1e;")
+        self._lm_chart_label.setSizePolicy(chart_policy)
+        right_layout.addWidget(self._lm_chart_label)
+
+        main_row.addWidget(left_widget)
+        main_row.addWidget(right_widget, 1)
+        layout.addLayout(main_row)
+
     def _build_params(self):
-        self._batch_size = self._add_spin("批次大小:", 1, 256, 32, 1)
-        self._lr = self._add_dspin("学习率:", 0.0001, 1.0, 0.001, 0.001, decimals=4)
-        self._max_epochs = self._add_spin("最大轮数:", 1, 300, 30, 1)
-        self._augment = self._add_check("数据增强", True)
-        self._train_scrfd = self._add_check("同时训练SCRFD检测器", True)
-        self._load_lm_pretrained = self._add_check("加载Landmark预训练权重", True)
-        self._load_pretrained = self._add_check("加载SCRFD预训练权重", True)
-        self._fresh_start = self._add_check("从头训练（删除旧保存）", False)
+        ds_label = QLabel("数据集:")
+        self._params_area.addWidget(ds_label)
+        self._dataset_combo = QComboBox()
+        self._dataset_combo.addItem("manual_annotated", str(INSIGHTFACE_MANUAL_ANNOTATED_DIR))
+        lapa_dir = str(PRETRAIN_DATA_DIR / "lapa_training")
+        self._dataset_combo.addItem("LaPa", lapa_dir)
+        self._params_area.addWidget(self._dataset_combo)
+
+        model_row = QHBoxLayout()
+        self._train_scrfd_check = QCheckBox("训练SCRFD")
+        self._train_scrfd_check.setChecked(True)
+        self._train_lm_check = QCheckBox("训练Landmark")
+        self._train_lm_check.setChecked(True)
+        model_row.addWidget(self._train_scrfd_check)
+        model_row.addWidget(self._train_lm_check)
+        self._params_area.addLayout(model_row)
+
+        scrfd_grp = QGroupBox("SCRFD参数")
+        scrfd_vl = QVBoxLayout(scrfd_grp)
+        scrfd_vl.setContentsMargins(8, 12, 8, 8)
+        scrfd_row1 = QHBoxLayout()
+        scrfd_row1.addWidget(QLabel("批次:"))
+        self._scrfd_batch_size = QSpinBox()
+        self._scrfd_batch_size.setRange(1, 64)
+        self._scrfd_batch_size.setValue(8)
+        scrfd_row1.addWidget(self._scrfd_batch_size)
+        scrfd_row1.addWidget(QLabel("学习率:"))
+        self._scrfd_lr = QDoubleSpinBox()
+        self._scrfd_lr.setRange(0.0001, 1.0)
+        self._scrfd_lr.setDecimals(4)
+        self._scrfd_lr.setSingleStep(0.001)
+        self._scrfd_lr.setValue(0.001)
+        scrfd_row1.addWidget(self._scrfd_lr)
+        scrfd_vl.addLayout(scrfd_row1)
+        scrfd_row2 = QHBoxLayout()
+        scrfd_row2.addWidget(QLabel("轮数:"))
+        self._scrfd_epochs = QSpinBox()
+        self._scrfd_epochs.setRange(1, 300)
+        self._scrfd_epochs.setValue(30)
+        scrfd_row2.addWidget(self._scrfd_epochs)
+        self._load_scrfd_pretrained = QCheckBox("微调")
+        self._load_scrfd_pretrained.setChecked(True)
+        self._load_scrfd_pretrained.toggled.connect(
+            lambda checked: self._on_pretrain_toggled(checked, self._scrfd_lr, 0.001, 0.01))
+        scrfd_row2.addWidget(self._load_scrfd_pretrained)
+        scrfd_row2.addStretch()
+        scrfd_vl.addLayout(scrfd_row2)
+        self._params_area.addWidget(scrfd_grp)
+
+        lm_grp = QGroupBox("Landmark参数")
+        lm_vl = QVBoxLayout(lm_grp)
+        lm_vl.setContentsMargins(8, 12, 8, 8)
+        lm_row1 = QHBoxLayout()
+        lm_row1.addWidget(QLabel("批次:"))
+        self._lm_batch_size = QSpinBox()
+        self._lm_batch_size.setRange(1, 256)
+        self._lm_batch_size.setValue(32)
+        lm_row1.addWidget(self._lm_batch_size)
+        lm_row1.addWidget(QLabel("学习率:"))
+        self._lm_lr = QDoubleSpinBox()
+        self._lm_lr.setRange(0.0001, 1.0)
+        self._lm_lr.setDecimals(4)
+        self._lm_lr.setSingleStep(0.001)
+        self._lm_lr.setValue(0.01)
+        lm_row1.addWidget(self._lm_lr)
+        lm_vl.addLayout(lm_row1)
+        lm_row2 = QHBoxLayout()
+        lm_row2.addWidget(QLabel("轮数:"))
+        self._lm_epochs = QSpinBox()
+        self._lm_epochs.setRange(1, 300)
+        self._lm_epochs.setValue(30)
+        lm_row2.addWidget(self._lm_epochs)
+        self._load_lm_pretrained = QCheckBox("微调")
+        self._load_lm_pretrained.setChecked(True)
+        self._load_lm_pretrained.toggled.connect(
+            lambda checked: self._on_pretrain_toggled(checked, self._lm_lr, 0.01, 0.1))
+        lm_row2.addWidget(self._load_lm_pretrained)
+        lm_row2.addStretch()
+        lm_vl.addLayout(lm_row2)
+        self._params_area.addWidget(lm_grp)
+
+        common_grp = QGroupBox("通用")
+        common_vl = QVBoxLayout(common_grp)
+        common_vl.setContentsMargins(8, 12, 8, 8)
+        self._augment = QCheckBox("数据增强")
+        self._augment.setChecked(True)
+        common_vl.addWidget(self._augment)
+        self._fresh_start = QCheckBox("从头训练")
+        self._fresh_start.toggled.connect(self._on_fresh_start_toggled)
+        common_vl.addWidget(self._fresh_start)
+        self._deploy_onnx = QCheckBox("导出后部署到antelopev2")
+        common_vl.addWidget(self._deploy_onnx)
+        self._params_area.addWidget(common_grp)
 
         btn_row = QHBoxLayout()
         self._train_btn = QPushButton("开始训练")
-        self._train_btn.setFixedWidth(120)
-        self._train_btn.setStyleSheet("QPushButton { background-color: #0078D4; color: white; font-weight: bold; }")
+        self._train_btn.setStyleSheet("QPushButton { background-color: #0078D4; color: white; font-weight: bold; }"
+                                      "QPushButton:disabled { background-color: #cccccc; color: #666666; }")
         self._train_btn.clicked.connect(self._on_train)
         btn_row.addWidget(self._train_btn)
 
         self._stop_btn = QPushButton("停止")
-        self._stop_btn.setFixedWidth(80)
         self._stop_btn.setProperty("danger", True)
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self._on_stop)
         btn_row.addWidget(self._stop_btn)
-
-        self._lm_preview_btn = QPushButton("Landmark预览")
-        self._lm_preview_btn.setFixedWidth(110)
-        self._lm_preview_btn.setProperty("outline", True)
-        self._lm_preview_btn.clicked.connect(self._on_lm_preview)
-        btn_row.addWidget(self._lm_preview_btn)
-
-        self._scrfd_preview_btn = QPushButton("SCRFD预览")
-        self._scrfd_preview_btn.setFixedWidth(100)
-        self._scrfd_preview_btn.setProperty("outline", True)
-        self._scrfd_preview_btn.clicked.connect(self._on_scrfd_preview)
-        btn_row.addWidget(self._scrfd_preview_btn)
+        self._params_area.addLayout(btn_row)
 
         self._export_btn = QPushButton("导出ONNX")
-        self._export_btn.setFixedWidth(100)
         self._export_btn.setProperty("outline", True)
         self._export_btn.clicked.connect(self._on_export)
-        btn_row.addWidget(self._export_btn)
-
-        btn_row.addStretch()
-        self._params_area.addLayout(btn_row)
+        self._params_area.addWidget(self._export_btn)
 
         self._status_label = QLabel("就绪")
         self._status_label.setStyleSheet("font-size: 12px; color: #666666;")
         self._params_area.addWidget(self._status_label)
 
-        lm_chart_label = QLabel("Landmark损失曲线:")
-        lm_chart_label.setStyleSheet("font-size: 12px; font-weight: bold; margin-top: 8px;")
-        self._params_area.addWidget(lm_chart_label)
-
-        self._lm_chart_label = QLabel()
-        self._lm_chart_label.setMinimumHeight(150)
-        self._lm_chart_label.setStyleSheet("border: 1px solid #ccc; background-color: #1e1e1e;")
-        self._params_area.addWidget(self._lm_chart_label)
-
-        self._scrfd_chart_label = QLabel()
-        self._scrfd_chart_label.setMinimumHeight(150)
-        self._scrfd_chart_label.setStyleSheet("border: 1px solid #ccc; background-color: #1e1e1e;")
-        self._scrfd_chart_group = QWidget()
-        scrfd_chart_layout = QVBoxLayout(self._scrfd_chart_group)
-        scrfd_chart_label = QLabel("SCRFD损失曲线:")
-        scrfd_chart_label.setStyleSheet("font-size: 12px; font-weight: bold; margin-top: 4px;")
-        scrfd_chart_layout.addWidget(scrfd_chart_label)
-        scrfd_chart_layout.addWidget(self._scrfd_chart_label)
-        self._params_area.addWidget(self._scrfd_chart_group)
-
-        log_label = QLabel("训练日志:")
-        log_label.setStyleSheet("font-size: 12px; font-weight: bold; margin-top: 8px;")
-        self._params_area.addWidget(log_label)
-
-        self._log_text = QTextEdit()
-        self._log_text.setReadOnly(True)
-        self._log_text.setMaximumHeight(150)
-        self._log_text.setStyleSheet(
-            "QTextEdit { background-color: #1e1e1e; color: #cccccc; "
-            "font-family: Consolas, monospace; font-size: 11px; }")
-        self._params_area.addWidget(self._log_text)
+        self._params_area.addStretch()
 
         self._lm_trainer = None
         self._scrfd_trainer = None
-        self._lm_thread = None
-        self._scrfd_thread = None
+        self._train_thread = None
+        self._training = False
 
         self._lm_signals = _ProgressSignal()
         self._lm_signals.progress_ready.connect(self._on_lm_epoch)
@@ -3052,12 +3191,139 @@ class Step7IFTrain(StepPanel):
         self._scrfd_preview_signal = _PreviewSignal()
         self._scrfd_preview_signal.preview_ready.connect(self._show_scrfd_preview)
 
-        self._lm_preview_dialog = None
-        self._scrfd_preview_dialog = None
-        self._train_scrfd_checked = True
+        self._all_done_signal = _ProgressSignal()
+        self._all_done_signal.done_ready.connect(self._on_all_done)
+
+        self._preview_timer = QTimer()
+        self._preview_timer.timeout.connect(self._request_previews)
+        self._preview_timer.start(5000)
+
+        self._load_saved_configs()
+
+    def _load_saved_configs(self):
+        import json
+        scrfd_cfg = SCRFD_MODEL_DIR / "SCRFD_config.json"
+        if scrfd_cfg.exists():
+            try:
+                d = json.loads(scrfd_cfg.read_text(encoding='utf-8'))
+                self._scrfd_batch_size.setValue(d.get('batch_size', 8))
+                self._scrfd_epochs.setValue(d.get('max_epochs', 30))
+                had_pretrain = bool(d.get('pretrained_onnx', ''))
+                self._load_scrfd_pretrained.blockSignals(True)
+                self._load_scrfd_pretrained.setChecked(had_pretrain)
+                self._load_scrfd_pretrained.blockSignals(False)
+                self._scrfd_lr.setValue(d.get('learning_rate', 0.001 if had_pretrain else 0.01))
+            except Exception:
+                pass
+
+        lm_cfg = IF_LANDMARK_MODEL_DIR / "IFLandmark_config.json"
+        if lm_cfg.exists():
+            try:
+                d = json.loads(lm_cfg.read_text(encoding='utf-8'))
+                self._lm_batch_size.setValue(d.get('batch_size', 32))
+                self._lm_epochs.setValue(d.get('max_epochs', 30))
+                had_pretrain = bool(d.get('pretrained_onnx', ''))
+                self._load_lm_pretrained.blockSignals(True)
+                self._load_lm_pretrained.setChecked(had_pretrain)
+                self._load_lm_pretrained.blockSignals(False)
+                self._lm_lr.setValue(d.get('learning_rate', 0.01 if had_pretrain else 0.1))
+            except Exception:
+                pass
+
+        scrfd_ts = SCRFD_MODEL_DIR / "SCRFD_training_state.json"
+        if scrfd_ts.exists():
+            try:
+                ts = json.loads(scrfd_ts.read_text(encoding='utf-8'))
+                hist = ts.get('loss_history', [])
+                if hist:
+                    chart = self._generate_chart_from_history(hist)
+                    self._set_scaled_pixmap(chart, self._scrfd_chart_label)
+            except Exception:
+                pass
+
+        lm_ts = IF_LANDMARK_MODEL_DIR / "IFLandmark_training_state.json"
+        if lm_ts.exists():
+            try:
+                ts = json.loads(lm_ts.read_text(encoding='utf-8'))
+                hist = ts.get('loss_history', [])
+                if hist:
+                    chart = self._generate_chart_from_history(hist)
+                    self._set_scaled_pixmap(chart, self._lm_chart_label)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _generate_chart_from_history(loss_history, width: int = 600, height: int = 200) -> np.ndarray:
+        canvas = np.full((height, width, 3), 30, dtype=np.uint8)
+        if not loss_history or len(loss_history) < 2:
+            return canvas
+        epochs = [h[0] for h in loss_history]
+        losses = [h[1] for h in loss_history]
+        max_epoch = max(epochs)
+        max_loss = max(losses) if losses else 1.0
+        min_loss = min(losses) if losses else 0.0
+        loss_range = max(max_loss - min_loss, 1e-6)
+        margin = 40
+        plot_w = width - 2 * margin
+        plot_h = height - 2 * margin
+        pts = []
+        for ep, ls in zip(epochs, losses):
+            x = margin + int((ep / max_epoch) * plot_w) if max_epoch > 0 else margin
+            y = margin + plot_h - int(((ls - min_loss) / loss_range) * plot_h)
+            pts.append((x, y))
+        cv2.line(canvas, (margin, margin), (margin, height - margin), (100, 100, 100), 1)
+        cv2.line(canvas, (margin, height - margin), (width - margin, height - margin), (100, 100, 100), 1)
+        for i in range(1, len(pts)):
+            cv2.line(canvas, pts[i - 1], pts[i], (0, 200, 0), 2)
+        cv2.putText(canvas, f"loss={losses[-1]:.6f}", (margin, margin - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.putText(canvas, f"epoch={epochs[-1]}", (width - margin - 80, height - margin + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        return canvas
+
+    def _on_pretrain_toggled(self, checked: bool, lr_spin: QDoubleSpinBox,
+                             finetune_lr: float, normal_lr: float):
+        if checked:
+            lr_spin.setValue(finetune_lr)
+        else:
+            lr_spin.setValue(normal_lr)
+
+    def _on_fresh_start_toggled(self, checked: bool):
+        if not checked:
+            return
+        reply = QMessageBox.warning(
+            self, "从头训练",
+            "假如点击确定，则将删除以前所有的训练文件，从零开始重新训练！\n若真的需要从头训练，请点击确定，否则点击否。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            self._fresh_start.blockSignals(True)
+            self._fresh_start.setChecked(False)
+            self._fresh_start.blockSignals(False)
+
+    def _request_previews(self):
+        if not self._training:
+            return
+        if self._train_thread is not None and not self._train_thread.is_alive():
+            self._check_all_done()
+            return
+        if self._scrfd_trainer is not None:
+            self._scrfd_trainer.request_preview()
+        if self._lm_trainer is not None:
+            self._lm_trainer.request_preview()
 
     def _on_train(self):
-        data_dir = INSIGHTFACE_MANUAL_ANNOTATED_DIR
+        if self._training:
+            return
+        do_scrfd = self._train_scrfd_check.isChecked()
+        do_lm = self._train_lm_check.isChecked()
+        if not do_scrfd and not do_lm:
+            QMessageBox.warning(self, "警告", "请至少选择一个模型进行训练。")
+            return
+
+        self._scrfd_trainer = None
+        self._lm_trainer = None
+        data_dir = Path(self._dataset_combo.currentData())
         if not data_dir.exists():
             QMessageBox.warning(self, "警告", f"数据目录不存在:\n{data_dir}")
             return
@@ -3068,126 +3334,124 @@ class Step7IFTrain(StepPanel):
             return
 
         lm_model_dir = IF_LANDMARK_MODEL_DIR
-        lm_model_dir.mkdir(parents=True, exist_ok=True)
+        scrfd_model_dir = SCRFD_MODEL_DIR
 
         if self._fresh_start.isChecked():
-            import glob as _glob
-            for d in [lm_model_dir, SCRFD_MODEL_DIR]:
+            import shutil
+            dirs_to_clear = []
+            if do_scrfd:
+                dirs_to_clear.append(scrfd_model_dir)
+            if do_lm:
+                dirs_to_clear.append(lm_model_dir)
+            for d in dirs_to_clear:
+                d.mkdir(parents=True, exist_ok=True)
                 if d.exists():
                     for f in d.iterdir():
                         if f.suffix in ('.pth', '.json', '.txt') or f.name == '.save_complete':
                             f.unlink()
-            self._log_text.append("已删除旧模型保存，从头开始训练。")
+                    bk = d / "autobackups"
+                    if bk.exists():
+                        shutil.rmtree(bk, ignore_errors=True)
+
+        if do_lm:
+            lm_model_dir.mkdir(parents=True, exist_ok=True)
+        if do_scrfd:
+            scrfd_model_dir.mkdir(parents=True, exist_ok=True)
 
         self._train_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._export_btn.setEnabled(False)
-        self._status_label.setText("训练中...")
-        self._log_text.clear()
+        if do_scrfd and do_lm:
+            self._status_label.setText("训练中: SCRFD → Landmark...")
+        elif do_scrfd:
+            self._status_label.setText("训练中: SCRFD...")
+        else:
+            self._status_label.setText("训练中: Landmark...")
+        self._training = True
+        self._stop_requested = False
 
-        batch_size = self._batch_size.value()
-        lr = self._lr.value()
-        max_epochs = self._max_epochs.value()
         augment = self._augment.isChecked()
-        self._train_scrfd_checked = self._train_scrfd.isChecked()
 
-        self._scrfd_chart_group.setVisible(self._train_scrfd_checked)
+        scrfd_bs = self._scrfd_batch_size.value()
+        scrfd_lr = self._scrfd_lr.value()
+        scrfd_epochs = self._scrfd_epochs.value()
+        load_scrfd_pretrained = self._load_scrfd_pretrained.isChecked()
 
-        from faceswap.business.if_landmark_trainer import IFLandmarkTrainer
-        self._lm_trainer = IFLandmarkTrainer(device="auto")
+        lm_bs = self._lm_batch_size.value()
+        lm_lr = self._lm_lr.value()
+        lm_epochs = self._lm_epochs.value()
+        load_lm_pretrained = self._load_lm_pretrained.isChecked()
 
-        def _lm_on_epoch(epoch: int, loss: float, lr_val: float):
-            self._lm_signals.progress_ready.emit(
-                f"[LM] Epoch {epoch}/{max_epochs}  loss={loss:.6f}  lr={lr_val:.6f}")
-
-        def _lm_on_preview(img: np.ndarray):
-            self._lm_preview_signal.preview_ready.emit(img)
-
-        def _lm_on_save(epoch: int):
-            pass
-
-        def _lm_task():
+        def _task():
             try:
-                lm_pretrained = None
-                if self._load_lm_pretrained.isChecked():
-                    from faceswap.setting import INSIGHTFACE_MODEL_DIR, INSIGHTFACE_MODEL_PACKAGE
-                    lm_pretrained = str(INSIGHTFACE_MODEL_DIR / "models" / INSIGHTFACE_MODEL_PACKAGE / "2d106det.onnx")
-                self._lm_trainer.train(
-                    data_dir=data_dir,
-                    model_dir=lm_model_dir,
-                    batch_size=batch_size,
-                    learning_rate=lr,
-                    max_epochs=max_epochs,
-                    augment=augment,
-                    pretrained_onnx=lm_pretrained,
-                    on_epoch=_lm_on_epoch,
-                    on_preview=_lm_on_preview,
-                    on_save=_lm_on_save,
-                )
-                self._lm_signals.done_ready.emit("Landmark训练完成", "")
-            except Exception as e:
-                self._lm_signals.error_ready.emit("Landmark训练错误", str(e))
-
-        self._lm_thread = threading.Thread(target=_lm_task, daemon=True)
-        self._lm_thread.start()
-
-        if self._train_scrfd_checked:
-            scrfd_model_dir = SCRFD_MODEL_DIR
-            scrfd_model_dir.mkdir(parents=True, exist_ok=True)
-
-            from faceswap.business.scrfd_trainer import SCRFDTrainer
-            self._scrfd_trainer = SCRFDTrainer(device="auto")
-
-            def _scrfd_on_epoch(epoch: int, loss: float, lr_val: float):
-                self._scrfd_signals.progress_ready.emit(
-                    f"[SCRFD] Epoch {epoch}/{max_epochs}  loss={loss:.6f}  lr={lr_val:.6f}")
-
-            def _scrfd_on_preview(img: np.ndarray):
-                self._scrfd_preview_signal.preview_ready.emit(img)
-
-            def _scrfd_on_save(epoch: int):
-                pass
-
-            def _scrfd_task():
-                try:
+                if do_scrfd:
+                    from faceswap.business.scrfd_trainer import SCRFDTrainer
+                    self._scrfd_trainer = SCRFDTrainer(device="auto")
                     pretrained_path = None
-                    if self._load_pretrained.isChecked():
+                    if load_scrfd_pretrained:
                         from faceswap.setting import INSIGHTFACE_MODEL_DIR, INSIGHTFACE_MODEL_PACKAGE
                         pretrained_path = str(INSIGHTFACE_MODEL_DIR / "models" / INSIGHTFACE_MODEL_PACKAGE / "scrfd_10g_bnkps.onnx")
                     self._scrfd_trainer.train(
                         data_dir=data_dir,
                         model_dir=scrfd_model_dir,
-                        batch_size=min(batch_size, 8),
-                        learning_rate=lr,
-                        max_epochs=max_epochs,
+                        batch_size=scrfd_bs,
+                        learning_rate=scrfd_lr,
+                        max_epochs=scrfd_epochs,
                         augment=augment,
                         pretrained_onnx=pretrained_path,
-                        on_epoch=_scrfd_on_epoch,
-                        on_preview=_scrfd_on_preview,
-                        on_save=_scrfd_on_save,
+                        on_epoch=lambda e, l, r: self._scrfd_signals.progress_ready.emit(f"Epoch {e}/{scrfd_epochs}  loss={l:.6f}  lr={r:.6f}"),
+                        on_preview=lambda img: self._scrfd_preview_signal.preview_ready.emit(img),
+                        on_save=lambda e: None,
                     )
                     self._scrfd_signals.done_ready.emit("SCRFD训练完成", "")
-                except Exception as e:
-                    self._scrfd_signals.error_ready.emit("SCRFD训练错误", str(e))
+                    self._scrfd_trainer = None
 
-            self._scrfd_thread = threading.Thread(target=_scrfd_task, daemon=True)
-            self._scrfd_thread.start()
+                if self._stop_requested:
+                    return
+
+                if do_lm:
+                    from faceswap.business.if_landmark_trainer import IFLandmarkTrainer
+                    self._lm_trainer = IFLandmarkTrainer(device="auto")
+                    lm_pretrained = None
+                    if load_lm_pretrained:
+                        from faceswap.setting import INSIGHTFACE_MODEL_DIR, INSIGHTFACE_MODEL_PACKAGE
+                        lm_pretrained = str(INSIGHTFACE_MODEL_DIR / "models" / INSIGHTFACE_MODEL_PACKAGE / "2d106det.onnx")
+                    self._lm_trainer.train(
+                        data_dir=data_dir,
+                        model_dir=lm_model_dir,
+                        batch_size=lm_bs,
+                        learning_rate=lm_lr,
+                        max_epochs=lm_epochs,
+                        augment=augment,
+                        pretrained_onnx=lm_pretrained,
+                        on_epoch=lambda e, l, r: self._lm_signals.progress_ready.emit(f"Epoch {e}/{lm_epochs}  loss={l:.6f}  lr={r:.6f}"),
+                        on_preview=lambda img: self._lm_preview_signal.preview_ready.emit(img),
+                        on_save=lambda e: None,
+                    )
+                    self._lm_signals.done_ready.emit("Landmark训练完成", "")
+            finally:
+                self._all_done_signal.done_ready.emit("", "")
+
+        self._train_thread = threading.Thread(target=_task, daemon=True)
+        self._train_thread.start()
 
     def _on_stop(self):
-        if self._lm_trainer is not None:
-            self._lm_trainer.request_stop()
+        self._stop_requested = True
         if self._scrfd_trainer is not None:
             self._scrfd_trainer.request_stop()
+        if self._lm_trainer is not None:
+            self._lm_trainer.request_stop()
         self._stop_btn.setEnabled(False)
         self._status_label.setText("正在停止...")
 
-    def _on_lm_preview(self):
-        if self._lm_trainer is not None:
-            self._lm_trainer.request_preview()
-
-    def _on_scrfd_preview(self):
-        if self._scrfd_trainer is not None:
-            self._scrfd_trainer.request_preview()
+        from PyQt6.QtCore import QTimer
+        def _check_stop_timeout():
+            if self._train_thread is not None and self._train_thread.is_alive():
+                self._status_label.setText("停止超时，训练线程仍在运行，请等待或关闭程序")
+            else:
+                self._on_all_done("", "")
+                self._status_label.setText("训练已停止")
+        QTimer.singleShot(15000, _check_stop_timeout)
 
     def _on_export(self):
         lm_pth = IF_LANDMARK_MODEL_DIR / "if_net.pth"
@@ -3199,7 +3463,7 @@ class Step7IFTrain(StepPanel):
             net.load_state_dict(state)
             onnx_path = IF_LANDMARK_MODEL_DIR / "if_landmark_2d106.onnx"
             net.export_onnx(str(onnx_path))
-            self._log_text.append(f"[导出] Landmark ONNX: {onnx_path}")
+            print(f"[导出] Landmark ONNX: {onnx_path}")
 
         scrfd_pth = SCRFD_MODEL_DIR / "scrfd_net.pth"
         if scrfd_pth.exists():
@@ -3210,131 +3474,92 @@ class Step7IFTrain(StepPanel):
             net.load_state_dict(state)
             onnx_path = SCRFD_MODEL_DIR / "scrfd_custom.onnx"
             net.export_onnx(str(onnx_path), input_size=640)
-            self._log_text.append(f"[导出] SCRFD ONNX: {onnx_path}")
+            print(f"[导出] SCRFD ONNX: {onnx_path}")
 
         if not lm_pth.exists() and not scrfd_pth.exists():
             QMessageBox.warning(self, "警告", "模型文件不存在，请先训练。")
             return
-        QMessageBox.information(self, "导出完成", "ONNX模型已导出。")
 
-    def _on_lm_epoch(self, msg: str):
-        self._log_text.append(msg)
-        if self._lm_trainer is not None:
-            chart = self._lm_trainer.generate_loss_chart()
-            from PyQt6.QtGui import QImage, QPixmap
-            h, w = chart.shape[:2]
-            qimg = QImage(chart.data, w, h, w * 3, QImage.Format.Format_BGR888)
-            self._lm_chart_label.setPixmap(QPixmap.fromImage(qimg))
-        self._update_status()
+        if self._deploy_onnx.isChecked():
+            import shutil
+            from faceswap.setting import INSIGHTFACE_MODEL_DIR, INSIGHTFACE_MODEL_PACKAGE
+            antelope_dir = INSIGHTFACE_MODEL_DIR / "models" / INSIGHTFACE_MODEL_PACKAGE
+            deployed = []
+            lm_onnx = IF_LANDMARK_MODEL_DIR / "if_landmark_2d106.onnx"
+            if lm_onnx.exists():
+                dst = antelope_dir / "2d106det.onnx"
+                if dst.exists():
+                    bak = dst.with_suffix(".onnx.bak")
+                    shutil.copy2(str(dst), str(bak))
+                    print(f"[部署] 备份原模型: {bak}")
+                shutil.copy2(str(lm_onnx), str(dst))
+                deployed.append(str(dst))
+                print(f"[部署] Landmark ONNX -> {dst}")
+            scrfd_onnx = SCRFD_MODEL_DIR / "scrfd_custom.onnx"
+            if scrfd_onnx.exists():
+                dst = antelope_dir / "scrfd_10g_bnkps.onnx"
+                if dst.exists():
+                    bak = dst.with_suffix(".onnx.bak")
+                    shutil.copy2(str(dst), str(bak))
+                    print(f"[部署] 备份原模型: {bak}")
+                shutil.copy2(str(scrfd_onnx), str(dst))
+                deployed.append(str(dst))
+                print(f"[部署] SCRFD ONNX -> {dst}")
+            if deployed:
+                QMessageBox.information(self, "部署完成", f"ONNX已部署到antelopev2:\n" + "\n".join(deployed))
+            else:
+                QMessageBox.warning(self, "警告", "导出成功但无ONNX文件可部署。")
+        else:
+            QMessageBox.information(self, "导出完成", "ONNX模型已导出。")
+
+    def _set_scaled_pixmap(self, img: np.ndarray, label: AutoScaleLabel) -> None:
+        from PyQt6.QtGui import QImage, QPixmap
+        img = np.ascontiguousarray(img)
+        h, w = img.shape[:2]
+        qimg = QImage(img.tobytes(), w, h, w * 3, QImage.Format.Format_BGR888)
+        pixmap = QPixmap.fromImage(qimg)
+        label.setRawPixmap(pixmap)
 
     def _on_scrfd_epoch(self, msg: str):
-        self._log_text.append(msg)
+        self._status_label.setText(f"SCRFD: {msg}")
         if self._scrfd_trainer is not None:
             chart = self._scrfd_trainer.generate_loss_chart()
-            from PyQt6.QtGui import QImage, QPixmap
-            h, w = chart.shape[:2]
-            qimg = QImage(chart.data, w, h, w * 3, QImage.Format.Format_BGR888)
-            self._scrfd_chart_label.setPixmap(QPixmap.fromImage(qimg))
-        self._update_status()
+            self._set_scaled_pixmap(chart, self._scrfd_chart_label)
 
-    def _update_status(self):
-        lm_alive = self._lm_thread is not None and self._lm_thread.is_alive()
-        scrfd_alive = self._scrfd_thread is not None and self._scrfd_thread.is_alive()
-        if lm_alive and scrfd_alive:
-            self._status_label.setText("训练中: Landmark + SCRFD")
-        elif lm_alive:
-            self._status_label.setText("训练中: Landmark")
-        elif scrfd_alive:
-            self._status_label.setText("训练中: SCRFD")
-        elif self._stop_btn.isEnabled():
-            self._status_label.setText("训练完成")
-
-    def _on_lm_error(self, title: str, msg: str):
-        self._log_text.append(f"[错误] {title}: {msg}")
-        self._check_all_done()
+    def _on_lm_epoch(self, msg: str):
+        self._status_label.setText(f"Landmark: {msg}")
+        if self._lm_trainer is not None:
+            chart = self._lm_trainer.generate_loss_chart()
+            self._set_scaled_pixmap(chart, self._lm_chart_label)
 
     def _on_scrfd_error(self, title: str, msg: str):
-        self._log_text.append(f"[错误] {title}: {msg}")
-        self._check_all_done()
+        print(f"[SCRFD错误] {title}: {msg}", file=sys.stderr)
 
-    def _on_lm_done(self, title: str, msg: str):
-        self._log_text.append(f"[完成] {title}")
-        self._check_all_done()
+    def _on_lm_error(self, title: str, msg: str):
+        print(f"[Landmark错误] {title}: {msg}", file=sys.stderr)
 
     def _on_scrfd_done(self, title: str, msg: str):
-        self._log_text.append(f"[完成] {title}")
-        self._check_all_done()
+        pass
+
+    def _on_lm_done(self, title: str, msg: str):
+        pass
+
+    def _on_all_done(self, title: str, msg: str):
+        self._training = False
+        self._train_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        self._export_btn.setEnabled(True)
+        self._status_label.setText("训练完成")
 
     def _check_all_done(self):
-        lm_done = self._lm_thread is None or not self._lm_thread.is_alive()
-        scrfd_done = (self._scrfd_thread is None or not self._scrfd_thread.is_alive()) if self._train_scrfd_checked else True
-        if lm_done and scrfd_done:
-            self._train_btn.setEnabled(True)
-            self._stop_btn.setEnabled(False)
-            self._export_btn.setEnabled(True)
-            self._status_label.setText("训练完成")
-
-    def _show_lm_preview(self, img: np.ndarray):
-        if self._lm_preview_dialog is None:
-            self._lm_preview_dialog = QDialog(self)
-            self._lm_preview_dialog.setWindowTitle("Landmark 预览")
-            self._lm_preview_dialog.setMinimumSize(800, 600)
-            layout = QVBoxLayout(self._lm_preview_dialog)
-            self._lm_preview_image_label = QLabel()
-            layout.addWidget(self._lm_preview_image_label)
-            hint = QLabel("绿色=预测  红色=标注  [P]刷新  [Esc]关闭")
-            hint.setStyleSheet("color: #666666; font-size: 11px;")
-            layout.addWidget(hint)
-            self._lm_preview_dialog.keyPressEvent = self._lm_preview_key_press
-
-        from PyQt6.QtGui import QImage, QPixmap
-        h, w = img.shape[:2]
-        qimg = QImage(img.data, w, h, w * 3, QImage.Format.Format_BGR888)
-        self._lm_preview_image_label.setPixmap(QPixmap.fromImage(qimg))
-        if not self._lm_preview_dialog.isVisible():
-            self._lm_preview_dialog.show()
-
-    def _lm_preview_key_press(self, event):
-        from PyQt6.QtCore import Qt
-        key = event.key()
-        if key == Qt.Key.Key_Escape:
-            self._lm_preview_dialog.close()
-        elif key == Qt.Key.Key_P:
-            if self._lm_trainer is not None:
-                self._lm_trainer.request_preview()
-        else:
-            QDialog.keyPressEvent(self._lm_preview_dialog, event)
+        if self._train_thread is None or not self._train_thread.is_alive():
+            self._on_all_done("", "")
 
     def _show_scrfd_preview(self, img: np.ndarray):
-        if self._scrfd_preview_dialog is None:
-            self._scrfd_preview_dialog = QDialog(self)
-            self._scrfd_preview_dialog.setWindowTitle("SCRFD 预览")
-            self._scrfd_preview_dialog.setMinimumSize(800, 600)
-            layout = QVBoxLayout(self._scrfd_preview_dialog)
-            self._scrfd_preview_image_label = QLabel()
-            layout.addWidget(self._scrfd_preview_image_label)
-            hint = QLabel("绿色=标注  红色=检测  [P]刷新  [Esc]关闭")
-            hint.setStyleSheet("color: #666666; font-size: 11px;")
-            layout.addWidget(hint)
-            self._scrfd_preview_dialog.keyPressEvent = self._scrfd_preview_key_press
+        self._set_scaled_pixmap(img, self._scrfd_preview_label)
 
-        from PyQt6.QtGui import QImage, QPixmap
-        h, w = img.shape[:2]
-        qimg = QImage(img.data, w, h, w * 3, QImage.Format.Format_BGR888)
-        self._scrfd_preview_image_label.setPixmap(QPixmap.fromImage(qimg))
-        if not self._scrfd_preview_dialog.isVisible():
-            self._scrfd_preview_dialog.show()
-
-    def _scrfd_preview_key_press(self, event):
-        from PyQt6.QtCore import Qt
-        key = event.key()
-        if key == Qt.Key.Key_Escape:
-            self._scrfd_preview_dialog.close()
-        elif key == Qt.Key.Key_P:
-            if self._scrfd_trainer is not None:
-                self._scrfd_trainer.request_preview()
-        else:
-            QDialog.keyPressEvent(self._scrfd_preview_dialog, event)
+    def _show_lm_preview(self, img: np.ndarray):
+        self._set_scaled_pixmap(img, self._lm_preview_label)
 
 
 class Step8Workspace(StepPanel):
