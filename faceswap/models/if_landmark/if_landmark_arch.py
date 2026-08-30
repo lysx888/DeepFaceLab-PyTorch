@@ -94,6 +94,18 @@ class IFLandmarkNet(nn.Module):
         for init in m.graph.initializer:
             onnx_weights[init.name] = onnx.numpy_helper.to_array(init)
 
+        bn_eps_map = {}
+        for node in m.graph.node:
+            if node.op_type == "BatchNormalization":
+                eps = 1e-3
+                for attr in node.attribute:
+                    if attr.name == "epsilon":
+                        eps = onnx.helper.get_attribute_value(attr)
+                        break
+                for init_name in node.input:
+                    if init_name.endswith("_batchnorm_gamma"):
+                        bn_eps_map[init_name[:-len("_batchnorm_gamma")]] = eps
+
         new_state = {}
         for name, param in self.state_dict().items():
             parts = name.split('.')
@@ -107,7 +119,16 @@ class IFLandmarkNet(nn.Module):
                 continue
             arr = np.asarray(arr)
             if parts[1] == "prelu":
-                arr = arr.squeeze()
+                target_shape = param.shape
+                if arr.size == 1:
+                    arr = np.full(target_shape[0], float(arr.flatten()[0]))
+                else:
+                    arr = arr.squeeze()
+                    if arr.ndim > 1:
+                        raise ValueError(
+                            f"PRelu gamma shape {arr.shape} 不兼容 nn.PReLU (per-element)")
+                    if arr.shape[0] != target_shape[0]:
+                        arr = np.broadcast_to(arr, target_shape).copy()
             new_state[name] = torch.from_numpy(arr.copy()).float()
 
         missing, unexpected = self.load_state_dict(new_state, strict=False)
@@ -115,6 +136,13 @@ class IFLandmarkNet(nn.Module):
             _logger.warning(f"未加载的参数: {missing}")
         if unexpected:
             _logger.warning(f"多余的参数: {unexpected}")
+
+        for name, module in self.named_modules():
+            if isinstance(module, nn.BatchNorm2d):
+                block = name.split('.')[0]
+                if block in bn_eps_map:
+                    module.eps = bn_eps_map[block]
+
         _logger.info(f"从ONNX加载预训练权重: {onnx_path}")
 
     @staticmethod
