@@ -541,6 +541,7 @@ class ImageCanvas(QWidget):
             group = _IDX_TO_GROUP_106.get(nearest)
             if group is not None:
                 self._visible_group = group
+                self._active_idx = -1
                 self.update()
         else:
             self._visible_group = None
@@ -1080,19 +1081,19 @@ class ManualAnnotatorDialog(QDialog):
 
     def _toggle_visibility(self):
         canvas = self._canvas
+        group = canvas._visible_group
+        if group is not None:
+            canvas.toggle_group_visibility(group)
+            invisible_count = sum(1 for v in canvas.get_lm106_visibility().values() if not v)
+            self._status.setText(f"已切换 {group} 可见性，当前不可见点: {invisible_count}")
+            return
         active = canvas._active_idx
         if active >= 0 and active in canvas._landmarks_106:
             canvas.toggle_point_visibility(active)
             vis = canvas.get_lm106_visibility().get(active, True)
             self._status.setText(f"点 {active} 已标记为{'可见' if vis else '不可见'}")
             return
-        group = canvas._visible_group
-        if group is None:
-            QMessageBox.information(self, "提示", "请先双击锁定一个五官部位，或点击选中一个点")
-            return
-        canvas.toggle_group_visibility(group)
-        invisible_count = sum(1 for v in canvas.get_lm106_visibility().values() if not v)
-        self._status.setText(f"已切换 {group} 可见性，当前不可见点: {invisible_count}")
+        QMessageBox.information(self, "提示", "请先双击锁定一个五官部位，或点击选中一个点")
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_V:
@@ -1316,7 +1317,6 @@ class ManualAnnotatorDialog(QDialog):
             if gname == group_name:
                 for idx in gidxs:
                     if idx in lm106:
-                        self._canvas._active_idx = idx
                         self._status.setText(f"编辑: {group_name} - 左键拖动调整")
                         return
                 if gidxs:
