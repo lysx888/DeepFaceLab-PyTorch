@@ -406,11 +406,12 @@ class SCRFDNet(nn.Module):
             wrapper, dummy, path,
             input_names=["input.1"],
             output_names=[str(i) for i in range(9)],
-            opset_version=11,
+            opset_version=18,
             external_data=False,
             dynamic_axes={
                 "input.1": {2: "height", 3: "width"},
             },
+            dynamo=False,
         )
         _logger.info(f"SCRFD ONNX exported: {path} (dynamic input)")
 
