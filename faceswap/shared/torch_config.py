@@ -46,7 +46,7 @@ def get_dataloader_config(mode: str = "gpu_train", dataset_size: int = 0) -> dic
     if is_cpu_mode or dataset_size < 4:
         pf = None
     else:
-        pf = 2
+        pf = 1
     return {
         "pin_memory": not is_cpu_mode,
         "prefetch_factor": pf,

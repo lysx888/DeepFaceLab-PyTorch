@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
@@ -178,5 +179,14 @@ def get_num_workers(device: "torch.device" = None) -> int:
         avail_gb = 8.0
 
     max_by_cpu = max(1, physical // 2)
-    max_by_mem = max(1, int(avail_gb / 2))
+    mem_per_worker = 2.0
+    if sys.platform == "win32":
+        try:
+            import psutil
+            swap_total_gb = psutil.swap_memory().total / (1024 ** 3)
+            if swap_total_gb < 8:
+                mem_per_worker = 8.0
+        except Exception:
+            pass
+    max_by_mem = max(1, int(avail_gb / mem_per_worker))
     return min(max_by_cpu, max_by_mem, 8)
