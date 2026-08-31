@@ -34,7 +34,7 @@ XSEG_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "xseg"
 SAEHD_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "saehd"
 AMP_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "amp"
 QUICK96_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "quick96"
-PRETRAIN_DATA_DIR: Final[Path] = _WORKSPACE_ROOT / "pretrain_faces"
+PRETRAIN_DATA_DIR: Final[Path] = _WORKSPACE_ROOT / "insightface_train" / "pretrain_faces"
 
 INSIGHTFACE_TRAIN_DIR: Final[Path] = _WORKSPACE_ROOT / "insightface_train"
 INSIGHTFACE_MANUAL_ANNOTATED_DIR: Final[Path] = _WORKSPACE_ROOT / "insightface_train" / "manual_annotated"
