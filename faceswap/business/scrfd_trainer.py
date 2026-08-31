@@ -211,7 +211,7 @@ class SCRFDTrainer:
             )
 
         if start_epoch > 0:
-            opt_pth = Path(model_dir) / "SCRFD_scrfd_opt.pth"
+            opt_pth = Path(model_dir) / "scrfd_opt.pth"
             if opt_pth.exists():
                 try:
                     opt_state = torch.load(opt_pth, map_location=device, weights_only=False)
