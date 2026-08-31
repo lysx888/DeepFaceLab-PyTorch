@@ -174,10 +174,10 @@ class SCRFDTrainer:
 
         if is_finetune:
             for m in net.modules():
-                if isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                if isinstance(m, nn.BatchNorm2d):
                     m.weight.requires_grad = False
                     m.bias.requires_grad = False
-            _logger.info("Finetune: BN/GN frozen (identity), all other layers trainable with layerwise lr")
+            _logger.info("Finetune: BN frozen (identity), all other layers trainable with layerwise lr")
 
             groups = {'backbone': [], 'neck': [], 'convs': [], 'preds': []}
             for name, param in net.named_parameters():
@@ -238,7 +238,7 @@ class SCRFDTrainer:
             net.train()
             if is_finetune:
                 for m in net.modules():
-                    if isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                    if isinstance(m, nn.BatchNorm2d):
                         m.eval()
             epoch_losses = []
             for batch_idx, batch in enumerate(loader):
