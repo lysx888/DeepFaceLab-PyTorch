@@ -73,16 +73,6 @@ class SCRFDModel(BaseModel):
                                dst_indices: list[int]) -> dict[str, list]:
         return {}
 
-    def build_optimizers(self) -> None:
-        lr = self.config.learning_rate
-        optimizer = torch.optim.SGD(
-            self.scrfd_net.parameters(),
-            lr=lr,
-            momentum=self.config.momentum,
-            weight_decay=self.config.weight_decay,
-        )
-        self.register_optimizer('scrfd_opt', optimizer)
-
     def try_load(self) -> None:
         super().try_load()
 

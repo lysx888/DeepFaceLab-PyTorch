@@ -9,35 +9,6 @@ _BASE_SIZES = [16, 64, 256]
 _ANCHOR_SCALES = [1, 2]
 
 
-def generate_anchors(input_size, strides=_FEAT_STRIDES, num_anchors=_NUM_ANCHORS,
-                     base_sizes=_BASE_SIZES, scales=_ANCHOR_SCALES, device='cpu'):
-    all_anchors = []
-    num_per_level = []
-    for stride, base_size in zip(strides, base_sizes):
-        feat_h = input_size // stride
-        feat_w = input_size // stride
-        centers = torch.zeros(feat_h, feat_w, 2, device=device)
-        for y in range(feat_h):
-            for x in range(feat_w):
-                centers[y, x, 0] = x * stride
-                centers[y, x, 1] = y * stride
-        centers = centers.reshape(-1, 2)
-
-        anchors_per_level = []
-        for scale in scales:
-            size = base_size * scale
-            half = size / 2.0
-            a = torch.cat([
-                centers[:, 0:1] - half, centers[:, 1:2] - half,
-                centers[:, 0:1] + half, centers[:, 1:2] + half,
-            ], dim=1)
-            anchors_per_level.append(a)
-        anchors = torch.stack(anchors_per_level, dim=1).reshape(-1, 4)
-        all_anchors.append(anchors)
-        num_per_level.append(anchors.shape[0])
-    return all_anchors, num_per_level
-
-
 def generate_anchors_fast(input_size, strides=_FEAT_STRIDES, num_anchors=_NUM_ANCHORS,
                           base_sizes=_BASE_SIZES, scales=_ANCHOR_SCALES, device='cpu'):
     all_anchors = []
