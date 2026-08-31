@@ -1,4 +1,5 @@
 import gc
+import json
 import threading
 import time
 from collections import deque
@@ -9,7 +10,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader
 
 from faceswap.business.if_landmark_dataset import IFLandmarkDataset, FLIP_MAP_106
 from faceswap.models.if_landmark.if_landmark_model import IFLandmarkModel, IFLandmarkTrainingConfig
@@ -73,6 +74,7 @@ class IFLandmarkTrainer:
         max_epochs: int = 30,
         augment: bool = True,
         pretrained_onnx: Optional[str] = None,
+        loss_type: str = "wing",
         on_epoch: Optional[Callable[[int, float, float], None]] = None,
         on_preview: Optional[Callable[[np.ndarray], None]] = None,
         on_save: Optional[Callable[[int], None]] = None,
@@ -82,6 +84,25 @@ class IFLandmarkTrainer:
         self._save_event.clear()
         device = self._resolve_device()
 
+        configure_torch("gpu_train" if is_gpu_device(device) else "cpu_train")
+
+        start_epoch = 0
+        restored_lr_steps = None
+        ts_pth = Path(model_dir) / "IFLandmark_training_state.json"
+        if ts_pth.exists():
+            try:
+                ts = json.loads(ts_pth.read_text(encoding='utf-8'))
+                start_epoch = ts.get('iter', 0)
+                restored_lr_steps = ts.get('lr_steps')
+            except Exception:
+                pass
+
+        lr_steps = [
+            start_epoch + int(0.50 * max_epochs),
+            start_epoch + int(0.83 * max_epochs),
+            start_epoch + int(0.93 * max_epochs),
+        ]
+
         config = IFLandmarkTrainingConfig(
             batch_size=batch_size,
             learning_rate=learning_rate,
@@ -90,9 +111,8 @@ class IFLandmarkTrainer:
             input_size=_INPUT_SIZE,
             data_dir=str(data_dir),
             pretrained_onnx=pretrained_onnx or '',
+            lr_steps=lr_steps,
         )
-
-        configure_torch("gpu_train" if is_gpu_device(device) else "cpu_train")
 
         if_model = IFLandmarkModel(config, Path(model_dir), device)
         self._if_model = if_model
@@ -100,7 +120,13 @@ class IFLandmarkTrainer:
         optimizer = if_model.get_optimizers_dict()['if_opt']
         scheduler = if_model._scheduler
 
-        start_epoch = if_model.get_aux_state().get('iter_count', 0)
+        if start_epoch > 0 and restored_lr_steps:
+            config.lr_steps = restored_lr_steps
+            for pg in optimizer.param_groups:
+                pg['lr'] = pg['initial_lr'] * (0.1 ** len([m for m in restored_lr_steps if m <= scheduler.last_epoch]))
+            _logger.info(f"续训: 复用上次lr_steps={restored_lr_steps}")
+        if_model.get_aux_state()['lr_steps'] = config.lr_steps
+
         restored_loss = if_model.get_aux_state().get('loss_history', [])
         if restored_loss:
             self._loss_history = restored_loss
@@ -111,7 +137,8 @@ class IFLandmarkTrainer:
             except Exception as e:
                 _logger.warning(f"加载预训练权重失败: {e}")
 
-        loss_fn = nn.L1Loss(reduction='mean')
+        from faceswap.models.if_landmark.if_landmark_loss import IFLandmarkLoss
+        loss_fn = IFLandmarkLoss(loss_type=loss_type, warmup_ratio=0.2).to(device)
 
         dataset = IFLandmarkDataset(
             data_dir=Path(data_dir),
@@ -145,7 +172,7 @@ class IFLandmarkTrainer:
         last_save_time = time.time()
         smooth_loss = deque(maxlen=100)
 
-        _logger.info(f"训练参数: max_epochs={max_epochs}, batch_size={batch_size}, lr={learning_rate}, start_epoch={start_epoch}")
+        _logger.info(f"训练参数: max_epochs={max_epochs}, batch_size={batch_size}, lr={learning_rate}, start_epoch={start_epoch}, lr_steps={lr_steps}")
         if start_epoch > 0:
             _logger.info(f"续训: 从第 {start_epoch} 轮开始，额外训练 {max_epochs} 轮 (到第 {start_epoch + max_epochs} 轮)")
 
@@ -161,10 +188,12 @@ class IFLandmarkTrainer:
 
                 images = batch['image'].to(device, non_blocking=get_non_blocking())
                 labels = batch['label'].to(device, non_blocking=get_non_blocking())
+                visibles = batch['visible'].to(device, non_blocking=get_non_blocking())
 
                 optimizer.zero_grad()
                 pred = net(images)
-                loss = loss_fn(pred, labels) * 5.0
+                progress = epoch / max(start_epoch + max_epochs - 1, 1)
+                loss = loss_fn(pred, labels, progress=progress, visible=visibles)
                 loss.backward()
                 optimizer.step()
 
@@ -173,6 +202,7 @@ class IFLandmarkTrainer:
                 smooth_loss.append(loss_val)
 
                 if batch_idx % 100 == 0:
+                    vis_rate = visibles.mean().item()
                     try:
                         import psutil
                         proc = psutil.Process()
@@ -182,11 +212,13 @@ class IFLandmarkTrainer:
                         _logger.info(
                             f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  batch {batch_idx}/{n_batches}  "
                             f"loss={loss_val:.6f}  lr={optimizer.param_groups[0]['lr']:.6f}  "
+                            f"vis={vis_rate:.2%}  "
                             f"mem={total_mb:.0f}MB(workers={len(children)})")
                     except Exception:
                         _logger.info(
                             f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  batch {batch_idx}/{n_batches}  "
-                            f"loss={loss_val:.6f}  lr={optimizer.param_groups[0]['lr']:.6f}")
+                            f"loss={loss_val:.6f}  lr={optimizer.param_groups[0]['lr']:.6f}  "
+                            f"vis={vis_rate:.2%}")
 
                 if self._preview_event.is_set():
                     self._preview_event.clear()
@@ -266,6 +298,7 @@ class IFLandmarkTrainer:
         dataset: IFLandmarkDataset,
         device: torch.device,
     ) -> np.ndarray:
+        was_training = net.training
         net.eval()
         n_samples = min(4, len(dataset))
         indices = np.random.choice(len(dataset), n_samples, replace=False)
@@ -278,36 +311,31 @@ class IFLandmarkTrainer:
         canvas_h = rows * (cell_size + gap) + gap
         canvas = np.full((canvas_h, canvas_w, 3), 30, dtype=np.uint8)
 
-        from insightface.utils.face_align import estimate_norm
-        _ALIGN_SIZE = 256
-        _KPS5_IDX = [34, 38, 88, 92, 86, 52, 61]
-        _KPS5_GROUPS = [[34, 38], [88, 92], [86], [52], [61]]
-
         with torch.no_grad():
             for i, idx in enumerate(indices):
-                img_path, landmarks, bbox = dataset._samples[idx]
+                img_path, landmarks, bbox, gt_visible = dataset._samples[idx]
                 img = dataset._read_image(img_path)
                 if img is None:
                     continue
 
-                kps5 = np.zeros((5, 2), dtype=np.float32)
-                for ki, grp in enumerate(_KPS5_GROUPS):
-                    kps5[ki] = landmarks[grp].mean(axis=0)
+                w = bbox[2] - bbox[0]
+                h = bbox[3] - bbox[1]
+                max_wh = max(w, h)
+                if max_wh < 1e-6:
+                    continue
+                center = np.array([(bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2], dtype=np.float32)
+                scale = _INPUT_SIZE / (max_wh * 1.5)
+                M = np.array([
+                    [scale, 0.0, _INPUT_SIZE / 2.0 - center[0] * scale],
+                    [0.0, scale, _INPUT_SIZE / 2.0 - center[1] * scale],
+                ], dtype=np.float32)
 
-                M = estimate_norm(kps5, _ALIGN_SIZE)
-                aligned = cv2.warpAffine(img, M, (_ALIGN_SIZE, _ALIGN_SIZE),
+                aligned = cv2.warpAffine(img, M, (cell_size, cell_size),
                                          flags=cv2.INTER_LINEAR, borderValue=0)
-                rs = cell_size / _ALIGN_SIZE
-                aligned = cv2.resize(aligned, (cell_size, cell_size))
 
-                def _tx(pts):
-                    pts = pts.astype(np.float32)
-                    out = np.zeros_like(pts)
-                    out[:, 0] = M[0, 0] * pts[:, 0] + M[0, 1] * pts[:, 1] + M[0, 2]
-                    out[:, 1] = M[1, 0] * pts[:, 0] + M[1, 1] * pts[:, 1] + M[1, 2]
-                    return out * rs
-
-                gt_a = _tx(landmarks)
+                gt_a = np.zeros_like(landmarks)
+                gt_a[:, 0] = M[0, 0] * landmarks[:, 0] + M[0, 1] * landmarks[:, 1] + M[0, 2]
+                gt_a[:, 1] = M[1, 0] * landmarks[:, 0] + M[1, 1] * landmarks[:, 1] + M[1, 2]
 
                 inp = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB).astype(np.float32)
                 inp = (inp - 127.5) / 128.0
@@ -324,14 +352,16 @@ class IFLandmarkTrainer:
                 for j in range(_NUM_LANDMARKS):
                     x, y = int(gt_a[j, 0]), int(gt_a[j, 1])
                     if 0 <= x < cell_size and 0 <= y < cell_size:
-                        cv2.circle(aligned, (x, y), 1, (0, 0, 255), -1)
+                        color = (0, 0, 255) if gt_visible[j] else (128, 128, 128)
+                        cv2.circle(aligned, (x, y), 1, color, -1)
 
                 col = i % cols
                 x0 = gap + col * (cell_size + gap)
                 y0 = gap
                 canvas[y0:y0 + cell_size, x0:x0 + cell_size] = aligned
 
-        net.train()
+        if was_training:
+            net.train()
         return canvas
 
     def generate_loss_chart(self, width: int = 600, height: int = 200) -> np.ndarray:

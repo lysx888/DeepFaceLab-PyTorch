@@ -17,7 +17,7 @@ _INPUT_SIZE = 640
 _NUM_KPS = 5
 _KPS_FLIP_ORDER = [1, 0, 2, 4, 3]
 _CROP_CHOICES = [0.3, 0.45, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
-_IMAGE_CACHE_MAX = 64
+_IMAGE_CACHE_MAX = 256
 
 
 def _random_square_crop(img, bboxes, keypointss, crop_choices=_CROP_CHOICES):

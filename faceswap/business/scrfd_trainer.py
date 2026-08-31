@@ -1,4 +1,5 @@
 import gc
+import json
 import threading
 import time
 from collections import deque
@@ -82,6 +83,28 @@ class SCRFDTrainer:
         self._save_event.clear()
         device = self._resolve_device()
 
+        configure_torch("gpu_train" if is_gpu_device(device) else "cpu_train")
+
+        start_epoch = 0
+        restored_lr_step_epochs = None
+        ts_pth = Path(model_dir) / "SCRFD_training_state.json"
+        if ts_pth.exists():
+            try:
+                ts = json.loads(ts_pth.read_text(encoding='utf-8'))
+                start_epoch = ts.get('iter', 0)
+                restored_lr_step_epochs = ts.get('lr_step_epochs')
+            except Exception:
+                pass
+
+        if start_epoch > 0 and restored_lr_step_epochs:
+            lr_step_epochs = restored_lr_step_epochs
+            _logger.info(f"续训: 复用上次lr_step_epochs={lr_step_epochs}")
+        else:
+            lr_step_epochs = [
+                start_epoch + int(0.67 * max_epochs),
+                start_epoch + int(0.90 * max_epochs),
+            ]
+
         config = SCRFDTrainingConfig(
             batch_size=batch_size,
             learning_rate=learning_rate,
@@ -90,15 +113,13 @@ class SCRFDTrainer:
             input_size=_INPUT_SIZE,
             data_dir=str(data_dir),
             pretrained_onnx=pretrained_onnx or '',
+            lr_step_epochs=lr_step_epochs,
         )
-
-        configure_torch("gpu_train" if is_gpu_device(device) else "cpu_train")
 
         scrfd_model = SCRFDModel(config, Path(model_dir), device)
         self._scrfd_model = scrfd_model
         net = scrfd_model.scrfd_net
 
-        start_epoch = scrfd_model.get_aux_state().get('iter_count', 0)
         restored_loss = scrfd_model.get_aux_state().get('loss_history', [])
         if restored_loss:
             self._loss_history = restored_loss
@@ -113,6 +134,7 @@ class SCRFDTrainer:
         if start_epoch > 0:
             is_finetune = scrfd_model.get_aux_state().get('is_finetune', False)
         scrfd_model.get_aux_state()['is_finetune'] = is_finetune
+        scrfd_model.get_aux_state()['lr_step_epochs'] = lr_step_epochs
 
         loss_fn = SCRFDLoss(input_size=_INPUT_SIZE).to(device)
 
@@ -152,10 +174,10 @@ class SCRFDTrainer:
 
         if is_finetune:
             for m in net.modules():
-                if isinstance(m, nn.BatchNorm2d):
+                if isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                     m.weight.requires_grad = False
                     m.bias.requires_grad = False
-            _logger.info("Finetune: BN frozen (identity), all other layers trainable with layerwise lr")
+            _logger.info("Finetune: BN/GN frozen (identity), all other layers trainable with layerwise lr")
 
             groups = {'backbone': [], 'neck': [], 'convs': [], 'preds': []}
             for name, param in net.named_parameters():
@@ -188,7 +210,18 @@ class SCRFDTrainer:
                 lr=base_lr, momentum=0.9, weight_decay=0.0005,
             )
 
-        _logger.info(f"训练参数: max_epochs={max_epochs}, batch_size={batch_size}, lr={learning_rate}, start_epoch={start_epoch}")
+        if start_epoch > 0:
+            opt_pth = Path(model_dir) / "SCRFD_scrfd_opt.pth"
+            if opt_pth.exists():
+                try:
+                    opt_state = torch.load(opt_pth, map_location=device, weights_only=False)
+                    optimizer.load_state_dict(opt_state)
+                    _logger.info(f"Restored optimizer state from {opt_pth.name}")
+                except Exception as e:
+                    _logger.warning(f"Failed to restore optimizer state: {e}")
+        scrfd_model.register_optimizer('scrfd_opt', optimizer)
+
+        _logger.info(f"训练参数: max_epochs={max_epochs}, batch_size={batch_size}, lr={learning_rate}, start_epoch={start_epoch}, lr_step_epochs={lr_step_epochs}")
         if start_epoch > 0:
             _logger.info(f"续训: 从第 {start_epoch} 轮开始，额外训练 {max_epochs} 轮 (到第 {start_epoch + max_epochs} 轮)")
 
@@ -205,7 +238,7 @@ class SCRFDTrainer:
             net.train()
             if is_finetune:
                 for m in net.modules():
-                    if isinstance(m, nn.BatchNorm2d):
+                    if isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                         m.eval()
             epoch_losses = []
             for batch_idx, batch in enumerate(loader):

@@ -21,7 +21,7 @@ _logger = get_logger("if_landmark_dataset")
 _INPUT_SIZE = 192
 _NUM_LANDMARKS = 106
 _HALF_SIZE = _INPUT_SIZE // 2
-_IMAGE_CACHE_MAX = 64
+_IMAGE_CACHE_MAX = 256
 
 _FLIP_PAIRS = [
     (101, 43), (105, 48), (104, 49), (103, 51), (102, 50), (97, 46), (98, 47), (99, 45), (100, 44),
@@ -95,7 +95,7 @@ class IFLandmarkDataset(Dataset):
         self._aug = _build_augment(self._augment)
         self._image_cache: OrderedDict[str, np.ndarray] = OrderedDict()
 
-        self._samples: list[tuple[Path, np.ndarray, np.ndarray]] = []
+        self._samples: list[tuple[Path, np.ndarray, np.ndarray, np.ndarray]] = []
         self._scan()
 
         if len(self._samples) == 0:
@@ -128,7 +128,12 @@ class IFLandmarkDataset(Dataset):
             bbox = np.asarray(bbox, dtype=np.float32)
             if bbox.shape != (4,):
                 continue
-            self._samples.append((img_path, lm, bbox))
+            vis = ann.get("landmarks_106_visibility")
+            if vis is not None and len(vis) == _NUM_LANDMARKS:
+                visibility = np.asarray(vis, dtype=bool)
+            else:
+                visibility = np.ones(_NUM_LANDMARKS, dtype=bool)
+            self._samples.append((img_path, lm, bbox, visibility))
 
     def _read_image(self, img_path: Path) -> np.ndarray | None:
         key = str(img_path)
@@ -146,24 +151,44 @@ class IFLandmarkDataset(Dataset):
         return len(self._samples)
 
     def __getitem__(self, index: int) -> dict:
-        img_path, landmarks, bbox = self._samples[index]
+        img_path, landmarks, bbox, ann_visible = self._samples[index]
         img = self._read_image(img_path)
         if img is None:
             img = np.zeros((self._input_size, self._input_size, 3), dtype=np.uint8)
             landmarks = np.zeros((_NUM_LANDMARKS, 2), dtype=np.float32)
+            ann_visible = np.zeros(_NUM_LANDMARKS, dtype=bool)
         else:
             w = bbox[2] - bbox[0]
             h = bbox[3] - bbox[1]
-            center = np.array([(bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2], dtype=np.float32)
-            scale = self._input_size / (max(w, h) * 1.5)
-            M = _get_similar_transform(center, scale, self._input_size)
-            img = cv2.warpAffine(img, M, (self._input_size, self._input_size),
-                                 flags=cv2.INTER_LINEAR, borderValue=0)
-            landmarks = _trans_points(landmarks.copy(), M)
+            max_wh = max(w, h)
+            if max_wh < 1e-6:
+                img = np.zeros((self._input_size, self._input_size, 3), dtype=np.uint8)
+                landmarks = np.zeros((_NUM_LANDMARKS, 2), dtype=np.float32)
+                ann_visible = np.zeros(_NUM_LANDMARKS, dtype=bool)
+            else:
+                center = np.array([(bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2], dtype=np.float32)
+                scale = self._input_size / (max_wh * 1.5)
+                M = _get_similar_transform(center, scale, self._input_size)
+                img = cv2.warpAffine(img, M, (self._input_size, self._input_size),
+                                     flags=cv2.INTER_LINEAR, borderValue=0)
+                landmarks = _trans_points(landmarks.copy(), M)
+
+        img_pre_aug = img
+        landmarks_pre_aug = landmarks.copy()
 
         t = self._aug(image=img, keypoints=landmarks.tolist())
-        img = t['image']
-        landmarks = np.array(t['keypoints'], dtype=np.float32)
+        img_aug = t['image']
+        landmarks_aug = np.array(t['keypoints'], dtype=np.float32)
+
+        _OOB_EPS = 1.0
+        in_bounds = (
+            (landmarks_aug[:, 0] >= -_OOB_EPS)
+            & (landmarks_aug[:, 0] <= self._input_size + _OOB_EPS)
+            & (landmarks_aug[:, 1] >= -_OOB_EPS)
+            & (landmarks_aug[:, 1] <= self._input_size + _OOB_EPS)
+        )
+
+        visible = ann_visible & in_bounds
 
         flipped = False
         if self._augment:
@@ -172,8 +197,17 @@ class IFLandmarkDataset(Dataset):
                     if trans.get("applied"):
                         flipped = True
 
-        if flipped:
-            landmarks = landmarks[FLIP_MAP_106, :]
+        if visible.sum() < _NUM_LANDMARKS * 0.5:
+            img = img_pre_aug
+            landmarks = landmarks_pre_aug
+            visible = ann_visible.copy()
+            flipped = False
+        else:
+            img = img_aug
+            landmarks = landmarks_aug
+            if flipped:
+                landmarks = landmarks[FLIP_MAP_106, :]
+                visible = visible[FLIP_MAP_106]
 
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = img.astype(np.float32)
@@ -184,5 +218,6 @@ class IFLandmarkDataset(Dataset):
         landmarks -= 1.0
         label = landmarks.flatten()
         label = torch.from_numpy(label).float()
+        visible_t = torch.from_numpy(visible.astype(np.float32))
 
-        return {'image': img, 'label': label, 'image_path': str(img_path)}
+        return {'image': img, 'label': label, 'visible': visible_t, 'image_path': str(img_path)}
