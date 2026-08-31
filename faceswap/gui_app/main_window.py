@@ -113,6 +113,12 @@ class MainWindow(QMainWindow):
 
         status = QStatusBar()
         self.setStatusBar(status)
+        from faceswap.shared.config import auto_select_device, get_device_name
+        dev = auto_select_device()
+        dev_name = get_device_name(dev)
+        self._device_label = QLabel(f"  {dev.type.upper()}: {dev_name}  ")
+        self._device_label.setStyleSheet("color: #888; font-size: 11px;")
+        status.addPermanentWidget(self._device_label)
         status.showMessage("就绪")
 
         self._switch(0)

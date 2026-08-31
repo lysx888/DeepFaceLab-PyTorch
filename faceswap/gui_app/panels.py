@@ -3064,8 +3064,10 @@ class Step7IFTrain(StepPanel):
         model_row = QHBoxLayout()
         self._train_scrfd_check = QCheckBox("训练SCRFD")
         self._train_scrfd_check.setChecked(True)
+        self._train_scrfd_check.setToolTip("勾选后训练SCRFD人脸检测模型")
         self._train_lm_check = QCheckBox("训练Landmark")
         self._train_lm_check.setChecked(True)
+        self._train_lm_check.setToolTip("勾选后训练106点Landmark模型")
         model_row.addWidget(self._train_scrfd_check)
         model_row.addWidget(self._train_lm_check)
         self._params_area.addLayout(model_row)
@@ -3078,6 +3080,7 @@ class Step7IFTrain(StepPanel):
         self._scrfd_batch_size = QSpinBox()
         self._scrfd_batch_size.setRange(1, 64)
         self._scrfd_batch_size.setValue(8)
+        self._scrfd_batch_size.setToolTip("每批训练图片数量。SCRFD输入640×640，显存占用大，建议4-16。")
         scrfd_row1.addWidget(self._scrfd_batch_size)
         scrfd_row1.addWidget(QLabel("学习率:"))
         self._scrfd_lr = QDoubleSpinBox()
@@ -3085,6 +3088,7 @@ class Step7IFTrain(StepPanel):
         self._scrfd_lr.setDecimals(4)
         self._scrfd_lr.setSingleStep(0.001)
         self._scrfd_lr.setValue(0.001)
+        self._scrfd_lr.setToolTip("学习率。微调(加载预训练)默认0.001，从头训练默认0.01。")
         scrfd_row1.addWidget(self._scrfd_lr)
         scrfd_vl.addLayout(scrfd_row1)
         scrfd_row2 = QHBoxLayout()
@@ -3092,9 +3096,11 @@ class Step7IFTrain(StepPanel):
         self._scrfd_epochs = QSpinBox()
         self._scrfd_epochs.setRange(1, 300)
         self._scrfd_epochs.setValue(30)
+        self._scrfd_epochs.setToolTip("额外训练轮数。每次点击训练都会训练这么多轮。\n续训时从上次结束的位置继续，不需要手动调大。")
         scrfd_row2.addWidget(self._scrfd_epochs)
         self._load_scrfd_pretrained = QCheckBox("微调")
         self._load_scrfd_pretrained.setChecked(True)
+        self._load_scrfd_pretrained.setToolTip("勾选后加载SCRFD预训练权重进行微调(首次训练时生效)。\n已有训练模型时自动续训，此选项被忽略。")
         self._load_scrfd_pretrained.toggled.connect(
             lambda checked: self._on_pretrain_toggled(checked, self._scrfd_lr, 0.001, 0.01))
         scrfd_row2.addWidget(self._load_scrfd_pretrained)
@@ -3110,6 +3116,7 @@ class Step7IFTrain(StepPanel):
         self._lm_batch_size = QSpinBox()
         self._lm_batch_size.setRange(1, 256)
         self._lm_batch_size.setValue(32)
+        self._lm_batch_size.setToolTip("每批训练图片数量。Landmark输入192×192，显存占用小，建议32-128。")
         lm_row1.addWidget(self._lm_batch_size)
         lm_row1.addWidget(QLabel("学习率:"))
         self._lm_lr = QDoubleSpinBox()
@@ -3117,6 +3124,7 @@ class Step7IFTrain(StepPanel):
         self._lm_lr.setDecimals(4)
         self._lm_lr.setSingleStep(0.001)
         self._lm_lr.setValue(0.01)
+        self._lm_lr.setToolTip("学习率。微调(加载预训练)默认0.01，从头训练默认0.1。")
         lm_row1.addWidget(self._lm_lr)
         lm_vl.addLayout(lm_row1)
         lm_row2 = QHBoxLayout()
@@ -3124,14 +3132,25 @@ class Step7IFTrain(StepPanel):
         self._lm_epochs = QSpinBox()
         self._lm_epochs.setRange(1, 300)
         self._lm_epochs.setValue(30)
+        self._lm_epochs.setToolTip("额外训练轮数。每次点击训练都会训练这么多轮。\n续训时从上次结束的位置继续，不需要手动调大。")
         lm_row2.addWidget(self._lm_epochs)
         self._load_lm_pretrained = QCheckBox("微调")
         self._load_lm_pretrained.setChecked(True)
+        self._load_lm_pretrained.setToolTip("勾选后加载Landmark预训练权重进行微调(首次训练时生效)。\n已有训练模型时自动续训，此选项被忽略。")
         self._load_lm_pretrained.toggled.connect(
             lambda checked: self._on_pretrain_toggled(checked, self._lm_lr, 0.01, 0.1))
         lm_row2.addWidget(self._load_lm_pretrained)
         lm_row2.addStretch()
         lm_vl.addLayout(lm_row2)
+        lm_row3 = QHBoxLayout()
+        lm_row3.addWidget(QLabel("主Loss:"))
+        self._lm_loss_type = QComboBox()
+        self._lm_loss_type.addItem("Wing Loss", "wing")
+        self._lm_loss_type.addItem("Adaptive Wing Loss", "awing")
+        self._lm_loss_type.setToolTip("主损失函数类型。前20%轮数用Smooth L1预热，之后切换到主Loss。\nWing Loss: 对小误差敏感，适合精细定位。\nAdaptive Wing Loss: 自适应版本，对极端样本更鲁棒。")
+        lm_row3.addWidget(self._lm_loss_type)
+        lm_row3.addStretch()
+        lm_vl.addLayout(lm_row3)
         self._params_area.addWidget(lm_grp)
 
         common_grp = QGroupBox("通用")
@@ -3139,11 +3158,14 @@ class Step7IFTrain(StepPanel):
         common_vl.setContentsMargins(8, 12, 8, 8)
         self._augment = QCheckBox("数据增强")
         self._augment.setChecked(True)
+        self._augment.setToolTip("启用数据增强(颜色抖动、模糊、翻转、仿射变换等)，提高泛化能力。")
         common_vl.addWidget(self._augment)
         self._fresh_start = QCheckBox("从头训练")
         self._fresh_start.toggled.connect(self._on_fresh_start_toggled)
+        self._fresh_start.setToolTip("删除已训练的模型文件，从零开始重新训练。\n勾选时会弹出确认警告。")
         common_vl.addWidget(self._fresh_start)
-        self._deploy_onnx = QCheckBox("导出后部署到antelopev2")
+        self._deploy_onnx = QCheckBox("训练后部署到antelopev2")
+        self._deploy_onnx.setToolTip("训练结束后自动将导出的ONNX模型部署到antelopev2权重目录。\n部署前会备份原始权重为.onnx.bak。")
         common_vl.addWidget(self._deploy_onnx)
         self._params_area.addWidget(common_grp)
 
@@ -3160,15 +3182,6 @@ class Step7IFTrain(StepPanel):
         self._stop_btn.clicked.connect(self._on_stop)
         btn_row.addWidget(self._stop_btn)
         self._params_area.addLayout(btn_row)
-
-        self._export_btn = QPushButton("导出ONNX")
-        self._export_btn.setProperty("outline", True)
-        self._export_btn.clicked.connect(self._on_export)
-        self._params_area.addWidget(self._export_btn)
-
-        self._status_label = QLabel("就绪")
-        self._status_label.setStyleSheet("font-size: 12px; color: #666666;")
-        self._params_area.addWidget(self._status_label)
 
         self._params_area.addStretch()
 
@@ -3293,7 +3306,7 @@ class Step7IFTrain(StepPanel):
             return
         reply = QMessageBox.warning(
             self, "从头训练",
-            "假如点击确定，则将删除以前所有的训练文件，从零开始重新训练！\n若真的需要从头训练，请点击确定，否则点击否。",
+            "将删除以前所有的训练文件，从零开始重新训练！\n确定请点击\"是\"，否则点击\"否\"。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
@@ -3360,13 +3373,12 @@ class Step7IFTrain(StepPanel):
 
         self._train_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
-        self._export_btn.setEnabled(False)
         if do_scrfd and do_lm:
-            self._status_label.setText("训练中: SCRFD → Landmark...")
+            self.window().statusBar().showMessage("训练中: SCRFD → Landmark...")
         elif do_scrfd:
-            self._status_label.setText("训练中: SCRFD...")
+            self.window().statusBar().showMessage("训练中: SCRFD...")
         else:
-            self._status_label.setText("训练中: Landmark...")
+            self.window().statusBar().showMessage("训练中: Landmark...")
         self._training = True
         self._stop_requested = False
 
@@ -3381,6 +3393,7 @@ class Step7IFTrain(StepPanel):
         lm_lr = self._lm_lr.value()
         lm_epochs = self._lm_epochs.value()
         load_lm_pretrained = self._load_lm_pretrained.isChecked()
+        lm_loss_type = self._lm_loss_type.currentData()
 
         def _task():
             try:
@@ -3424,12 +3437,44 @@ class Step7IFTrain(StepPanel):
                         max_epochs=lm_epochs,
                         augment=augment,
                         pretrained_onnx=lm_pretrained,
+                        loss_type=lm_loss_type,
                         on_epoch=lambda e, l, r: self._lm_signals.progress_ready.emit(f"Epoch {e}/{lm_epochs}  loss={l:.6f}  lr={r:.6f}"),
                         on_preview=lambda img: self._lm_preview_signal.preview_ready.emit(img),
                         on_save=lambda e: None,
                     )
                     self._lm_signals.done_ready.emit("Landmark训练完成", "")
             finally:
+                if self._fresh_start.isChecked():
+                    self._fresh_start.blockSignals(True)
+                    self._fresh_start.setChecked(False)
+                    self._fresh_start.blockSignals(False)
+                if self._deploy_onnx.isChecked() and not self._stop_requested:
+                    try:
+                        import shutil
+                        from faceswap.setting import INSIGHTFACE_MODEL_DIR, INSIGHTFACE_MODEL_PACKAGE
+                        antelope_dir = INSIGHTFACE_MODEL_DIR / "models" / INSIGHTFACE_MODEL_PACKAGE
+                        deployed = []
+                        lm_onnx = IF_LANDMARK_MODEL_DIR / "if_landmark_2d106.onnx"
+                        if lm_onnx.exists():
+                            dst = antelope_dir / "2d106det.onnx"
+                            if dst.exists():
+                                bak = dst.with_suffix(".onnx.bak")
+                                shutil.copy2(str(dst), str(bak))
+                            shutil.copy2(str(lm_onnx), str(dst))
+                            deployed.append(str(dst))
+                        scrfd_onnx = SCRFD_MODEL_DIR / "scrfd_custom.onnx"
+                        if scrfd_onnx.exists():
+                            dst = antelope_dir / "scrfd_10g_bnkps.onnx"
+                            if dst.exists():
+                                bak = dst.with_suffix(".onnx.bak")
+                                shutil.copy2(str(dst), str(bak))
+                            shutil.copy2(str(scrfd_onnx), str(dst))
+                            deployed.append(str(dst))
+                        self._deploy_msg = f"ONNX已部署到antelopev2:\n" + "\n".join(deployed) if deployed else ""
+                    except Exception as e:
+                        self._deploy_msg = f"部署失败: {e}"
+                else:
+                    self._deploy_msg = ""
                 self._all_done_signal.done_ready.emit("", "")
 
         self._train_thread = threading.Thread(target=_task, daemon=True)
@@ -3442,75 +3487,16 @@ class Step7IFTrain(StepPanel):
         if self._lm_trainer is not None:
             self._lm_trainer.request_stop()
         self._stop_btn.setEnabled(False)
-        self._status_label.setText("正在停止...")
+        self.window().statusBar().showMessage("正在停止...")
 
         from PyQt6.QtCore import QTimer
         def _check_stop_timeout():
             if self._train_thread is not None and self._train_thread.is_alive():
-                self._status_label.setText("停止超时，训练线程仍在运行，请等待或关闭程序")
+                self.window().statusBar().showMessage("停止超时，训练线程仍在运行，请等待或关闭程序")
             else:
                 self._on_all_done("", "")
-                self._status_label.setText("训练已停止")
+                self.window().statusBar().showMessage("训练已停止")
         QTimer.singleShot(15000, _check_stop_timeout)
-
-    def _on_export(self):
-        lm_pth = IF_LANDMARK_MODEL_DIR / "if_net.pth"
-        if lm_pth.exists():
-            from faceswap.models.if_landmark.if_landmark_arch import IFLandmarkNet
-            import torch
-            net = IFLandmarkNet()
-            state = torch.load(lm_pth, map_location="cpu", weights_only=False)
-            net.load_state_dict(state)
-            onnx_path = IF_LANDMARK_MODEL_DIR / "if_landmark_2d106.onnx"
-            net.export_onnx(str(onnx_path))
-            print(f"[导出] Landmark ONNX: {onnx_path}")
-
-        scrfd_pth = SCRFD_MODEL_DIR / "scrfd_net.pth"
-        if scrfd_pth.exists():
-            from faceswap.models.scrfd.scrfd_arch import SCRFDNet
-            import torch
-            net = SCRFDNet()
-            state = torch.load(scrfd_pth, map_location="cpu", weights_only=False)
-            net.load_state_dict(state)
-            onnx_path = SCRFD_MODEL_DIR / "scrfd_custom.onnx"
-            net.export_onnx(str(onnx_path), input_size=640)
-            print(f"[导出] SCRFD ONNX: {onnx_path}")
-
-        if not lm_pth.exists() and not scrfd_pth.exists():
-            QMessageBox.warning(self, "警告", "模型文件不存在，请先训练。")
-            return
-
-        if self._deploy_onnx.isChecked():
-            import shutil
-            from faceswap.setting import INSIGHTFACE_MODEL_DIR, INSIGHTFACE_MODEL_PACKAGE
-            antelope_dir = INSIGHTFACE_MODEL_DIR / "models" / INSIGHTFACE_MODEL_PACKAGE
-            deployed = []
-            lm_onnx = IF_LANDMARK_MODEL_DIR / "if_landmark_2d106.onnx"
-            if lm_onnx.exists():
-                dst = antelope_dir / "2d106det.onnx"
-                if dst.exists():
-                    bak = dst.with_suffix(".onnx.bak")
-                    shutil.copy2(str(dst), str(bak))
-                    print(f"[部署] 备份原模型: {bak}")
-                shutil.copy2(str(lm_onnx), str(dst))
-                deployed.append(str(dst))
-                print(f"[部署] Landmark ONNX -> {dst}")
-            scrfd_onnx = SCRFD_MODEL_DIR / "scrfd_custom.onnx"
-            if scrfd_onnx.exists():
-                dst = antelope_dir / "scrfd_10g_bnkps.onnx"
-                if dst.exists():
-                    bak = dst.with_suffix(".onnx.bak")
-                    shutil.copy2(str(dst), str(bak))
-                    print(f"[部署] 备份原模型: {bak}")
-                shutil.copy2(str(scrfd_onnx), str(dst))
-                deployed.append(str(dst))
-                print(f"[部署] SCRFD ONNX -> {dst}")
-            if deployed:
-                QMessageBox.information(self, "部署完成", f"ONNX已部署到antelopev2:\n" + "\n".join(deployed))
-            else:
-                QMessageBox.warning(self, "警告", "导出成功但无ONNX文件可部署。")
-        else:
-            QMessageBox.information(self, "导出完成", "ONNX模型已导出。")
 
     def _set_scaled_pixmap(self, img: np.ndarray, label: AutoScaleLabel) -> None:
         from PyQt6.QtGui import QImage, QPixmap
@@ -3521,13 +3507,11 @@ class Step7IFTrain(StepPanel):
         label.setRawPixmap(pixmap)
 
     def _on_scrfd_epoch(self, msg: str):
-        self._status_label.setText(f"SCRFD: {msg}")
         if self._scrfd_trainer is not None:
             chart = self._scrfd_trainer.generate_loss_chart()
             self._set_scaled_pixmap(chart, self._scrfd_chart_label)
 
     def _on_lm_epoch(self, msg: str):
-        self._status_label.setText(f"Landmark: {msg}")
         if self._lm_trainer is not None:
             chart = self._lm_trainer.generate_loss_chart()
             self._set_scaled_pixmap(chart, self._lm_chart_label)
@@ -3548,8 +3532,12 @@ class Step7IFTrain(StepPanel):
         self._training = False
         self._train_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
-        self._export_btn.setEnabled(True)
-        self._status_label.setText("训练完成")
+        self.window().statusBar().showMessage("训练完成")
+        deploy_msg = getattr(self, '_deploy_msg', '')
+        if deploy_msg:
+            QMessageBox.information(self, "训练完成", f"训练已完成。\n{deploy_msg}")
+        else:
+            QMessageBox.information(self, "训练完成", "训练已完成。")
 
     def _check_all_done(self):
         if self._train_thread is None or not self._train_thread.is_alive():
