@@ -102,15 +102,15 @@ class ResNetV1e(nn.Module):
         return tuple(outs)
 
 
-class ConvGNReLU(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1, num_groups=16):
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size, stride=stride, padding=padding, bias=False)
-        self.gn = nn.GroupNorm(num_groups, out_ch)
+        self.bn = nn.BatchNorm2d(out_ch)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        return self.relu(self.gn(self.conv(x)))
+        return self.relu(self.bn(self.conv(x)))
 
 
 class PAFPN(nn.Module):
@@ -184,7 +184,7 @@ class SCRFDHead(nn.Module):
             cls_convs = nn.ModuleList()
             for i in range(stacked_convs):
                 chn = in_channels if i == 0 else feat_channels
-                cls_convs.append(ConvGNReLU(chn, feat_channels))
+                cls_convs.append(ConvBNReLU(chn, feat_channels))
             self.cls_convs.append(cls_convs)
 
             self.reg_convs.append(cls_convs)
@@ -278,18 +278,6 @@ class SCRFDNet(nn.Module):
                 state_dict[pt_bn + '.running_var'] = torch.ones_like(state_dict[pt_bn + '.running_var'])
                 loaded += 1
 
-        def _load_gn_folded(onnx_w_id: str, onnx_b_id: str, pt_conv: str, pt_gn: str):
-            nonlocal loaded
-            w = onnx_inits.get(onnx_w_id)
-            b = onnx_inits.get(onnx_b_id)
-            if w is not None and pt_conv + '.weight' in state_dict:
-                state_dict[pt_conv + '.weight'] = torch.from_numpy(w.copy())
-                loaded += 1
-            if b is not None and pt_gn + '.bias' in state_dict:
-                state_dict[pt_gn + '.weight'] = torch.ones_like(state_dict[pt_gn + '.weight'])
-                state_dict[pt_gn + '.bias'] = torch.from_numpy(b.copy())
-                loaded += 1
-
         def _load_plain_conv(onnx_w_name: str, onnx_b_name: str, pt_conv: str):
             nonlocal loaded
             w = onnx_inits.get(onnx_w_name)
@@ -345,19 +333,19 @@ class SCRFDNet(nn.Module):
         for ow, ob, pc, pb in _BACKBONE_BN_FOLDED:
             _load_bn_folded(ow, ob, pc, pb)
 
-        _HEAD_GN_FOLDED = [
-            ('667', '669', 'head.cls_convs.0.0.conv', 'head.cls_convs.0.0.gn'),
-            ('671', '673', 'head.cls_convs.0.1.conv', 'head.cls_convs.0.1.gn'),
-            ('675', '677', 'head.cls_convs.0.2.conv', 'head.cls_convs.0.2.gn'),
-            ('679', '681', 'head.cls_convs.1.0.conv', 'head.cls_convs.1.0.gn'),
-            ('683', '685', 'head.cls_convs.1.1.conv', 'head.cls_convs.1.1.gn'),
-            ('687', '689', 'head.cls_convs.1.2.conv', 'head.cls_convs.1.2.gn'),
-            ('691', '693', 'head.cls_convs.2.0.conv', 'head.cls_convs.2.0.gn'),
-            ('695', '697', 'head.cls_convs.2.1.conv', 'head.cls_convs.2.1.gn'),
-            ('699', '701', 'head.cls_convs.2.2.conv', 'head.cls_convs.2.2.gn'),
+        _HEAD_BN_FOLDED = [
+            ('667', '669', 'head.cls_convs.0.0.conv', 'head.cls_convs.0.0.bn'),
+            ('671', '673', 'head.cls_convs.0.1.conv', 'head.cls_convs.0.1.bn'),
+            ('675', '677', 'head.cls_convs.0.2.conv', 'head.cls_convs.0.2.bn'),
+            ('679', '681', 'head.cls_convs.1.0.conv', 'head.cls_convs.1.0.bn'),
+            ('683', '685', 'head.cls_convs.1.1.conv', 'head.cls_convs.1.1.bn'),
+            ('687', '689', 'head.cls_convs.1.2.conv', 'head.cls_convs.1.2.bn'),
+            ('691', '693', 'head.cls_convs.2.0.conv', 'head.cls_convs.2.0.bn'),
+            ('695', '697', 'head.cls_convs.2.1.conv', 'head.cls_convs.2.1.bn'),
+            ('699', '701', 'head.cls_convs.2.2.conv', 'head.cls_convs.2.2.bn'),
         ]
-        for ow, ob, pc, pg in _HEAD_GN_FOLDED:
-            _load_gn_folded(ow, ob, pc, pg)
+        for ow, ob, pc, pb in _HEAD_BN_FOLDED:
+            _load_bn_folded(ow, ob, pc, pb)
 
         _NECK_PLAIN = [
             ('neck.lateral_convs.0.conv.weight', 'neck.lateral_convs.0.conv.bias', 'neck.lateral_convs.0'),

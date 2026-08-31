@@ -9,7 +9,7 @@ _BASE_SIZES = [16, 64, 256]
 _ANCHOR_SCALES = [1, 2]
 
 
-def generate_anchors_fast(input_size, strides=_FEAT_STRIDES, num_anchors=_NUM_ANCHORS,
+def generate_anchors_fast(input_size, strides=_FEAT_STRIDES,
                           base_sizes=_BASE_SIZES, scales=_ANCHOR_SCALES, device='cpu'):
     all_anchors = []
     num_per_level = []
@@ -241,7 +241,7 @@ class SCRFDLoss(nn.Module):
     def _get_anchors(self, device):
         if self._anchor_list is None or self._anchor_list[0].device != device:
             self._anchor_list, self._num_per_level = generate_anchors_fast(
-                self.input_size, self.feat_strides, self.num_anchors,
+                self.input_size, self.feat_strides,
                 device=device)
         return self._anchor_list, self._num_per_level
 
