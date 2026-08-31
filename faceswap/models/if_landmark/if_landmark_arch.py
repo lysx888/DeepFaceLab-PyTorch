@@ -107,6 +107,7 @@ class IFLandmarkNet(nn.Module):
                         bn_eps_map[init_name[:-len("_batchnorm_gamma")]] = eps
 
         new_state = {}
+        loaded_count = 0
         for name, param in self.state_dict().items():
             parts = name.split('.')
             block = parts[0]
@@ -115,20 +116,27 @@ class IFLandmarkNet(nn.Module):
                 continue
             arr = onnx_weights.get(onnx_name)
             if arr is None:
-                _logger.warning(f"ONNX权重缺失: {onnx_name} (对应 {name})")
+                arr = onnx_weights.get(name)
+            if arr is None:
+                _logger.warning(f"ONNX权重缺失: {onnx_name} / {name}")
                 continue
+            loaded_count += 1
             arr = np.asarray(arr)
             if parts[1] == "prelu":
                 target_shape = param.shape
+                arr = arr.squeeze()
                 if arr.size == 1:
-                    arr = np.full(target_shape[0], float(arr.flatten()[0]))
+                    arr = np.full(target_shape, float(arr.flatten()[0]))
+                elif arr.shape == target_shape:
+                    pass
+                elif arr.ndim == 1 and arr.shape[0] == target_shape[0]:
+                    pass
                 else:
-                    arr = arr.squeeze()
-                    if arr.ndim > 1:
-                        raise ValueError(
-                            f"PRelu gamma shape {arr.shape} 不兼容 nn.PReLU (per-element)")
-                    if arr.shape[0] != target_shape[0]:
-                        arr = np.broadcast_to(arr, target_shape).copy()
+                    flat = arr.reshape(-1)
+                    if flat.shape[0] >= target_shape[0]:
+                        arr = flat[:target_shape[0]].reshape(target_shape)
+                    else:
+                        arr = np.broadcast_to(flat, target_shape).copy()
             new_state[name] = torch.from_numpy(arr.copy()).float()
 
         missing, unexpected = self.load_state_dict(new_state, strict=False)
@@ -136,14 +144,19 @@ class IFLandmarkNet(nn.Module):
             _logger.warning(f"未加载的参数: {missing}")
         if unexpected:
             _logger.warning(f"多余的参数: {unexpected}")
+        total = len(self.state_dict())
+        ratio = loaded_count / total if total > 0 else 0
+        if ratio < 0.5:
+            _logger.warning(
+                f"仅加载 {loaded_count}/{total} ({ratio:.0%}) 参数！pretrained_onnx可能不匹配此模型架构")
+        else:
+            _logger.info(f"从ONNX加载预训练权重: {onnx_path} ({loaded_count}/{total})")
 
         for name, module in self.named_modules():
             if isinstance(module, nn.BatchNorm2d):
                 block = name.split('.')[0]
                 if block in bn_eps_map:
                     module.eps = bn_eps_map[block]
-
-        _logger.info(f"从ONNX加载预训练权重: {onnx_path}")
 
     @staticmethod
     def _map_to_onnx_name(block: str, parts: list[str]) -> str | None:
@@ -169,6 +182,7 @@ class IFLandmarkNet(nn.Module):
         return None
 
     def export_onnx(self, path: str | Path) -> None:
+        was_training = self.training
         self.eval()
         device = next(self.parameters()).device
         dummy = torch.randn(1, 3, _INPUT_SIZE, _INPUT_SIZE, device=device)
@@ -182,4 +196,6 @@ class IFLandmarkNet(nn.Module):
             opset_version=18,
             dynamo=False,
         )
+        if was_training:
+            self.train()
         _logger.info(f"ONNX exported: {path}")
