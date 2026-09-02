@@ -27,7 +27,7 @@ def _build_region_weights() -> torch.Tensor:
     for idx in _NOSE_POINTS:
         weights[idx] = 1.5
     for idx in _CONTOUR_POINTS:
-        weights[idx] = 0.8
+        weights[idx] = 1.2
     return weights
 
 
@@ -69,17 +69,6 @@ class AdaptiveWingLoss(nn.Module):
         return loss
 
 
-def _compute_wing_scale(w: float, breakpoint: float, epsilon: float,
-                        ref_diff: float = 0.1) -> float:
-    smooth_l1_val = 0.5 * ref_diff * ref_diff if ref_diff < 1.0 else ref_diff - 0.5
-    if ref_diff < breakpoint:
-        wing_val = w * math.log(1.0 + ref_diff / epsilon)
-    else:
-        C = breakpoint - w * math.log(1.0 + breakpoint / epsilon)
-        wing_val = ref_diff - C
-    return smooth_l1_val / wing_val if wing_val > 0 else 1.0
-
-
 class IFLandmarkLoss(nn.Module):
     def __init__(self, loss_type: str = "wing", warmup_ratio: float = 0.2,
                  blend_ratio: float = 0.05):
@@ -90,10 +79,8 @@ class IFLandmarkLoss(nn.Module):
         self.smooth_l1 = nn.SmoothL1Loss(reduction='none')
         if loss_type == "awing":
             self.main_loss = AdaptiveWingLoss(w=0.5, theta=0.05, alpha=0.1)
-            self._wing_scale = _compute_wing_scale(0.5, 0.05, 0.1, ref_diff=0.1)
         else:
             self.main_loss = WingLoss(w=0.5, epsilon=0.1)
-            self._wing_scale = _compute_wing_scale(0.5, 0.5, 0.1, ref_diff=0.1)
         self.register_buffer('region_weights', _REGION_WEIGHTS.repeat_interleave(2).view(1, -1))
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor,
@@ -107,10 +94,10 @@ class IFLandmarkLoss(nn.Module):
         elif progress < warmup_end:
             alpha = (progress - blend_start) / self.blend_ratio
             sl1 = self.smooth_l1(pred, target)
-            wing = self.main_loss(pred, target) * self._wing_scale
+            wing = self.main_loss(pred, target)
             loss = (1.0 - alpha) * sl1 + alpha * wing
         else:
-            loss = self.main_loss(pred, target) * self._wing_scale
+            loss = self.main_loss(pred, target)
 
         if visible is None:
             mask = self.region_weights.expand(loss.shape[0], -1)

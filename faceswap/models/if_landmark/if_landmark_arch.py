@@ -108,12 +108,14 @@ class IFLandmarkNet(nn.Module):
 
         new_state = {}
         loaded_count = 0
+        expected_count = 0
         for name, param in self.state_dict().items():
             parts = name.split('.')
             block = parts[0]
             onnx_name = self._map_to_onnx_name(block, parts)
             if onnx_name is None:
                 continue
+            expected_count += 1
             arr = onnx_weights.get(onnx_name)
             if arr is None:
                 arr = onnx_weights.get(name)
@@ -137,6 +139,9 @@ class IFLandmarkNet(nn.Module):
                         arr = flat[:target_shape[0]].reshape(target_shape)
                     else:
                         arr = np.broadcast_to(flat, target_shape).copy()
+            if tuple(arr.shape) != tuple(param.shape):
+                raise RuntimeError(
+                    f"形状不匹配: {name} 期望 {tuple(param.shape)}, ONNX提供 {tuple(arr.shape)}")
             new_state[name] = torch.from_numpy(arr.copy()).float()
 
         missing, unexpected = self.load_state_dict(new_state, strict=False)
@@ -144,11 +149,12 @@ class IFLandmarkNet(nn.Module):
             _logger.warning(f"未加载的参数: {missing}")
         if unexpected:
             _logger.warning(f"多余的参数: {unexpected}")
-        total = len(self.state_dict())
+        total = expected_count
         ratio = loaded_count / total if total > 0 else 0
         if ratio < 0.5:
-            _logger.warning(
-                f"仅加载 {loaded_count}/{total} ({ratio:.0%}) 参数！pretrained_onnx可能不匹配此模型架构")
+            raise RuntimeError(
+                f"预训练权重匹配率仅 {loaded_count}/{total} ({ratio:.0%})，低于50%阈值。"
+                f"ONNX可能与模型架构不匹配: {onnx_path}")
         else:
             _logger.info(f"从ONNX加载预训练权重: {onnx_path} ({loaded_count}/{total})")
 

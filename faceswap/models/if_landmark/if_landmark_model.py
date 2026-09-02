@@ -86,13 +86,6 @@ class IFLandmarkModel(BaseModel):
         self._scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer=optimizer, lr_lambda=lr_step_func)
 
-    def on_pretrain_override(self) -> None:
-        pretrained_path = self.config.pretrained_onnx
-        if pretrained_path and Path(pretrained_path).exists():
-            self.if_net.load_pretrained_onnx(pretrained_path)
-        elif pretrained_path:
-            _logger.warning(f"预训练权重文件不存在: {pretrained_path}")
-
     def try_load(self) -> None:
         super().try_load()
         if self._scheduler is not None:
