@@ -172,9 +172,6 @@ class BaseModel(ABC):
     def build_optimizers(self) -> None:
         pass
 
-    def on_pretrain_override(self) -> None:
-        pass
-
     def try_load(self) -> None:
         self.cleanup_stale_tmp_dirs()
         save_marker = self.model_dir / '.save_complete'
@@ -193,6 +190,10 @@ class BaseModel(ABC):
                 self._aux_state['iter_count'] = ts.get('iter', 0)
                 if 'loss_history' in ts:
                     self._aux_state['loss_history'] = ts['loss_history']
+                for key, val in ts.items():
+                    if key in ('iter', 'loss_history'):
+                        continue
+                    self._aux_state[key] = val
             except Exception:
                 pass
         else:
@@ -273,6 +274,11 @@ class BaseModel(ABC):
             loss_hist = self._aux_state.get('loss_history')
             if loss_hist is not None:
                 training_state['loss_history'] = loss_hist
+            for key, val in self._aux_state.items():
+                if key in ('iter_count', 'loss_history', 'dataset_index', 'progressive_gan_state'):
+                    continue
+                if isinstance(val, (bool, int, float, str, list)):
+                    training_state[key] = val
             (tmp_dir / self._prefixed('training_state.json')).write_text(
                 json.dumps(training_state))
             rng_state = torch.random.get_rng_state()
