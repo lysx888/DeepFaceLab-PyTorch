@@ -3096,13 +3096,18 @@ class Step7IFTrain(StepPanel):
         self._scrfd_epochs = QSpinBox()
         self._scrfd_epochs.setRange(1, 300)
         self._scrfd_epochs.setValue(30)
-        self._scrfd_epochs.setToolTip("额外训练轮数。每次点击训练都会训练这么多轮。\n续训时从上次结束的位置继续，不需要手动调大。")
+        self._scrfd_epochs.setToolTip("额外训练轮数。每次点击训练都会训练这么多轮。\n续训时从上次结束的位置继续，lr_steps自动管理。")
         scrfd_row2.addWidget(self._scrfd_epochs)
         self._load_scrfd_pretrained = QCheckBox("微调")
         self._load_scrfd_pretrained.setChecked(True)
-        self._load_scrfd_pretrained.setToolTip("勾选后加载SCRFD预训练权重进行微调(首次训练时生效)。\n已有训练模型时自动续训，此选项被忽略。")
+        self._load_scrfd_pretrained.setToolTip(
+            "勾选后加载SCRFD预训练权重进行微调(分阶段训练)。\n"
+            "勾选+非刚性形变增强=针对嘴巴变形/遮挡的微调。\n"
+            "已有训练模型时自动续训。")
         self._load_scrfd_pretrained.toggled.connect(
             lambda checked: self._on_pretrain_toggled(checked, self._scrfd_lr, 0.001, 0.01))
+        self._load_scrfd_pretrained.toggled.connect(
+            lambda checked: self._deform_aug.setEnabled(checked or self._load_lm_pretrained.isChecked()))
         scrfd_row2.addWidget(self._load_scrfd_pretrained)
         scrfd_row2.addStretch()
         scrfd_vl.addLayout(scrfd_row2)
@@ -3132,11 +3137,17 @@ class Step7IFTrain(StepPanel):
         self._lm_epochs = QSpinBox()
         self._lm_epochs.setRange(1, 300)
         self._lm_epochs.setValue(30)
-        self._lm_epochs.setToolTip("额外训练轮数。每次点击训练都会训练这么多轮。\n续训时从上次结束的位置继续，不需要手动调大。")
+        self._lm_epochs.setToolTip("额外训练轮数。每次点击训练都会训练这么多轮。\n续训时从上次结束的位置继续，lr_steps自动管理。")
         lm_row2.addWidget(self._lm_epochs)
         self._load_lm_pretrained = QCheckBox("微调")
         self._load_lm_pretrained.setChecked(True)
-        self._load_lm_pretrained.setToolTip("勾选后加载Landmark预训练权重进行微调(首次训练时生效)。\n已有训练模型时自动续训，此选项被忽略。")
+        self._load_lm_pretrained.setToolTip(
+            "三种训练模式:\n"
+            "1. 不勾选=正常训练: 从零开始, 需要数十万~百万级数据集, 21张图会直接崩\n"
+            "2. 勾选=微调(刚性): 加载预训练权重+分阶段训练, 适合LaPa等正常人脸数据\n"
+            "3. 勾选+非刚性形变增强=微调(非刚性): 额外启用TPS形变/嘴部动作/Cutout遮挡增强,\n"
+            "   专门针对咀嚼/鼓腮/遮挡等非刚性形变场景\n"
+            "已有训练模型时自动续训, 此选项被忽略。")
         self._load_lm_pretrained.toggled.connect(
             lambda checked: self._on_pretrain_toggled(checked, self._lm_lr, 0.01, 0.1))
         lm_row2.addWidget(self._load_lm_pretrained)
@@ -3160,12 +3171,28 @@ class Step7IFTrain(StepPanel):
         self._augment.setChecked(True)
         self._augment.setToolTip("启用数据增强(颜色抖动、模糊、翻转、仿射变换等)，提高泛化能力。")
         common_vl.addWidget(self._augment)
+        self._deform_aug = QCheckBox("非刚性形变增强")
+        self._deform_aug.setChecked(False)
+        self._deform_aug.setEnabled(False)
+        self._deform_aug.setToolTip(
+            "非刚性形变增强(TPS形变+嘴部大动作+Cutout遮挡), 专门针对咀嚼/鼓腮/遮挡等场景。\n"
+            "仅在微调模式下可用。勾选后自动启用时序跳变检测。")
+        common_vl.addWidget(self._deform_aug)
+        self._load_lm_pretrained.toggled.connect(
+            lambda checked: self._deform_aug.setEnabled(checked or self._load_scrfd_pretrained.isChecked()))
+        self._deform_aug.setEnabled(self._load_lm_pretrained.isChecked() or self._load_scrfd_pretrained.isChecked())
         self._fresh_start = QCheckBox("从头训练")
         self._fresh_start.toggled.connect(self._on_fresh_start_toggled)
-        self._fresh_start.setToolTip("删除已训练的模型文件，从零开始重新训练。\n勾选时会弹出确认警告。")
+        self._fresh_start.setToolTip(
+            "删除已训练的模型文件，从零开始重新训练。\n"
+            "警告: 从头训练需要数十万~百万级数据集, 少量数据(如21张)会直接崩溃。\n"
+            "数据量少时请用微调模式。\n勾选时会弹出确认警告。")
         common_vl.addWidget(self._fresh_start)
         self._deploy_onnx = QCheckBox("训练后部署到antelopev2")
-        self._deploy_onnx.setToolTip("训练结束后自动将导出的ONNX模型部署到antelopev2权重目录。\n部署前会备份原始权重为.onnx.bak。")
+        self._deploy_onnx.setToolTip(
+            "训练结束后自动将导出的ONNX模型部署到antelopev2权重目录。\n"
+            "首次部署前会永久备份官方权重为.onnx.official(不被覆盖)，\n"
+            "后续微调始终从.official加载，避免自训权重污染初始化。")
         common_vl.addWidget(self._deploy_onnx)
         self._params_area.addWidget(common_grp)
 
@@ -3189,6 +3216,7 @@ class Step7IFTrain(StepPanel):
         self._scrfd_trainer = None
         self._train_thread = None
         self._training = False
+        self._train_error = None
 
         self._lm_signals = _ProgressSignal()
         self._lm_signals.progress_ready.connect(self._on_lm_epoch)
@@ -3306,10 +3334,23 @@ class Step7IFTrain(StepPanel):
             return
         reply = QMessageBox.warning(
             self, "从头训练",
-            "将删除以前所有的训练文件，从零开始重新训练！\n确定请点击\"是\"，否则点击\"否\"。",
+            "将删除以前所有的训练文件，从零开始重新训练！\n\n"
+            "注意: 从头训练会自动取消\"微调\"勾选(不加载预训练权重)。\n"
+            "从头训练需要数十万~百万级数据集，少量数据会崩溃。\n\n"
+            "确定请点击\"是\"，否则点击\"否\"。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
+            self._load_lm_pretrained.blockSignals(True)
+            self._load_lm_pretrained.setChecked(False)
+            self._load_lm_pretrained.blockSignals(False)
+            self._load_scrfd_pretrained.blockSignals(True)
+            self._load_scrfd_pretrained.setChecked(False)
+            self._load_scrfd_pretrained.blockSignals(False)
+            self._deform_aug.setEnabled(False)
+            self._lm_lr.setValue(0.1)
+            self._scrfd_lr.setValue(0.01)
+        else:
             self._fresh_start.blockSignals(True)
             self._fresh_start.setChecked(False)
             self._fresh_start.blockSignals(False)
@@ -3394,61 +3435,84 @@ class Step7IFTrain(StepPanel):
         lm_epochs = self._lm_epochs.value()
         load_lm_pretrained = self._load_lm_pretrained.isChecked()
         lm_loss_type = self._lm_loss_type.currentData()
+        lm_deform_aug = self._deform_aug.isChecked() and self._load_lm_pretrained.isChecked()
 
         def _task():
+            train_error = None
             try:
                 if do_scrfd:
-                    from faceswap.business.scrfd_trainer import SCRFDTrainer
-                    self._scrfd_trainer = SCRFDTrainer(device="auto")
-                    pretrained_path = None
-                    if load_scrfd_pretrained:
-                        from faceswap.setting import INSIGHTFACE_MODEL_DIR, INSIGHTFACE_MODEL_PACKAGE
-                        pretrained_path = str(INSIGHTFACE_MODEL_DIR / "models" / INSIGHTFACE_MODEL_PACKAGE / "scrfd_10g_bnkps.onnx")
-                    self._scrfd_trainer.train(
-                        data_dir=data_dir,
-                        model_dir=scrfd_model_dir,
-                        batch_size=scrfd_bs,
-                        learning_rate=scrfd_lr,
-                        max_epochs=scrfd_epochs,
-                        augment=augment,
-                        pretrained_onnx=pretrained_path,
-                        on_epoch=lambda e, l, r: self._scrfd_signals.progress_ready.emit(f"Epoch {e}/{scrfd_epochs}  loss={l:.6f}  lr={r:.6f}"),
-                        on_preview=lambda img: self._scrfd_preview_signal.preview_ready.emit(img),
-                        on_save=lambda e: None,
-                    )
-                    self._scrfd_signals.done_ready.emit("SCRFD训练完成", "")
-                    self._scrfd_trainer = None
+                    try:
+                        from faceswap.business.scrfd_trainer import SCRFDTrainer
+                        self._scrfd_trainer = SCRFDTrainer(device="auto")
+                        pretrained_path = None
+                        if load_scrfd_pretrained:
+                            from faceswap.setting import INSIGHTFACE_MODEL_DIR, INSIGHTFACE_MODEL_PACKAGE
+                            _scrfd_dir = INSIGHTFACE_MODEL_DIR / "models" / INSIGHTFACE_MODEL_PACKAGE
+                            _scrfd_official = _scrfd_dir / "scrfd_10g_bnkps.onnx.official"
+                            pretrained_path = str(_scrfd_official if _scrfd_official.exists() else _scrfd_dir / "scrfd_10g_bnkps.onnx")
+                        scrfd_deform = self._deform_aug.isChecked() and load_scrfd_pretrained
+                        self._scrfd_trainer.train(
+                            data_dir=data_dir,
+                            model_dir=scrfd_model_dir,
+                            batch_size=scrfd_bs,
+                            learning_rate=scrfd_lr,
+                            max_epochs=scrfd_epochs,
+                            augment=augment,
+                            pretrained_onnx=pretrained_path,
+                            deform_aug=scrfd_deform,
+                            finetune_mode=load_scrfd_pretrained,
+                            on_epoch=lambda e, l, r: self._scrfd_signals.progress_ready.emit(f"Epoch {e}/{scrfd_epochs}  loss={l:.6f}  lr={r:.6f}"),
+                            on_preview=lambda img: self._scrfd_preview_signal.preview_ready.emit(img),
+                            on_save=lambda e: None,
+                        )
+                        self._scrfd_signals.done_ready.emit("SCRFD训练完成", "")
+                    except Exception as e:
+                        train_error = e
+                        self._scrfd_signals.error_ready.emit("SCRFD训练失败", str(e))
+                    finally:
+                        self._scrfd_trainer = None
 
-                if self._stop_requested:
+                if train_error is not None or self._stop_requested:
                     return
 
                 if do_lm:
-                    from faceswap.business.if_landmark_trainer import IFLandmarkTrainer
-                    self._lm_trainer = IFLandmarkTrainer(device="auto")
-                    lm_pretrained = None
-                    if load_lm_pretrained:
-                        from faceswap.setting import INSIGHTFACE_MODEL_DIR, INSIGHTFACE_MODEL_PACKAGE
-                        lm_pretrained = str(INSIGHTFACE_MODEL_DIR / "models" / INSIGHTFACE_MODEL_PACKAGE / "2d106det.onnx")
-                    self._lm_trainer.train(
-                        data_dir=data_dir,
-                        model_dir=lm_model_dir,
-                        batch_size=lm_bs,
-                        learning_rate=lm_lr,
-                        max_epochs=lm_epochs,
-                        augment=augment,
-                        pretrained_onnx=lm_pretrained,
-                        loss_type=lm_loss_type,
-                        on_epoch=lambda e, l, r: self._lm_signals.progress_ready.emit(f"Epoch {e}/{lm_epochs}  loss={l:.6f}  lr={r:.6f}"),
-                        on_preview=lambda img: self._lm_preview_signal.preview_ready.emit(img),
-                        on_save=lambda e: None,
-                    )
-                    self._lm_signals.done_ready.emit("Landmark训练完成", "")
+                    try:
+                        from faceswap.business.if_landmark_trainer import IFLandmarkTrainer
+                        self._lm_trainer = IFLandmarkTrainer(device="auto")
+                        lm_pretrained = None
+                        if load_lm_pretrained:
+                            from faceswap.setting import INSIGHTFACE_MODEL_DIR, INSIGHTFACE_MODEL_PACKAGE
+                            _lm_dir = INSIGHTFACE_MODEL_DIR / "models" / INSIGHTFACE_MODEL_PACKAGE
+                            _official = _lm_dir / "2d106det.onnx.official"
+                            lm_pretrained = str(_official if _official.exists() else _lm_dir / "2d106det.onnx")
+                        self._lm_trainer.train(
+                            data_dir=data_dir,
+                            model_dir=lm_model_dir,
+                            batch_size=lm_bs,
+                            learning_rate=lm_lr,
+                            max_epochs=lm_epochs,
+                            augment=augment,
+                            pretrained_onnx=lm_pretrained,
+                            loss_type=lm_loss_type,
+                            deform_aug=lm_deform_aug,
+                            finetune_mode=load_lm_pretrained,
+                            on_epoch=lambda e, l, r: self._lm_signals.progress_ready.emit(f"Epoch {e}/{lm_epochs}  loss={l:.6f}  lr={r:.6f}"),
+                            on_preview=lambda img: self._lm_preview_signal.preview_ready.emit(img),
+                            on_save=lambda e: None,
+                        )
+                        self._lm_signals.done_ready.emit("Landmark训练完成", "")
+                    except Exception as e:
+                        train_error = e
+                        self._lm_signals.error_ready.emit("Landmark训练失败", str(e))
+                    finally:
+                        self._lm_trainer = None
             finally:
+                self._train_error = train_error
                 if self._fresh_start.isChecked():
                     self._fresh_start.blockSignals(True)
                     self._fresh_start.setChecked(False)
                     self._fresh_start.blockSignals(False)
-                if self._deploy_onnx.isChecked() and not self._stop_requested:
+                if self._deploy_onnx.isChecked() and not self._stop_requested and train_error is None:
                     try:
                         import shutil
                         from faceswap.setting import INSIGHTFACE_MODEL_DIR, INSIGHTFACE_MODEL_PACKAGE
@@ -3457,6 +3521,9 @@ class Step7IFTrain(StepPanel):
                         lm_onnx = IF_LANDMARK_MODEL_DIR / "if_landmark_2d106.onnx"
                         if lm_onnx.exists():
                             dst = antelope_dir / "2d106det.onnx"
+                            official = antelope_dir / "2d106det.onnx.official"
+                            if dst.exists() and not official.exists():
+                                shutil.copy2(str(dst), str(official))
                             if dst.exists():
                                 bak = dst.with_suffix(".onnx.bak")
                                 shutil.copy2(str(dst), str(bak))
@@ -3465,6 +3532,9 @@ class Step7IFTrain(StepPanel):
                         scrfd_onnx = SCRFD_MODEL_DIR / "scrfd_custom.onnx"
                         if scrfd_onnx.exists():
                             dst = antelope_dir / "scrfd_10g_bnkps.onnx"
+                            official = antelope_dir / "scrfd_10g_bnkps.onnx.official"
+                            if dst.exists() and not official.exists():
+                                shutil.copy2(str(dst), str(official))
                             if dst.exists():
                                 bak = dst.with_suffix(".onnx.bak")
                                 shutil.copy2(str(dst), str(bak))
@@ -3518,9 +3588,11 @@ class Step7IFTrain(StepPanel):
 
     def _on_scrfd_error(self, title: str, msg: str):
         print(f"[SCRFD错误] {title}: {msg}", file=sys.stderr)
+        QMessageBox.critical(self, title, msg)
 
     def _on_lm_error(self, title: str, msg: str):
         print(f"[Landmark错误] {title}: {msg}", file=sys.stderr)
+        QMessageBox.critical(self, title, msg)
 
     def _on_scrfd_done(self, title: str, msg: str):
         pass
@@ -3532,6 +3604,10 @@ class Step7IFTrain(StepPanel):
         self._training = False
         self._train_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+        train_error = getattr(self, '_train_error', None)
+        if train_error is not None:
+            self.window().statusBar().showMessage("训练失败")
+            return
         self.window().statusBar().showMessage("训练完成")
         deploy_msg = getattr(self, '_deploy_msg', '')
         if deploy_msg:

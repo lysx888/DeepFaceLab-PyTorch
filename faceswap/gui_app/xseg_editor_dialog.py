@@ -1118,8 +1118,9 @@ class XSegEditorDialog(QDialog):
         self._loader_thread.start()
 
     def done(self, result):
-        self._loader_thread.stop()
-        self._loader_thread.wait()
+        if self._loader_thread is not None:
+            self._loader_thread.stop()
+            self._loader_thread.wait()
         super().done(result)
 
     def resizeEvent(self, event):
