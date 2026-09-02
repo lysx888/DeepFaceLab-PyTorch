@@ -2998,7 +2998,7 @@ class Step7IFTrain(StepPanel):
         main_row.setSpacing(12)
 
         left_widget = QWidget()
-        left_widget.setFixedWidth(250)
+        left_widget.setFixedWidth(300)
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(6)
