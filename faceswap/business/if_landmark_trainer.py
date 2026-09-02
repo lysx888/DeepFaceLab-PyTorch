@@ -65,6 +65,60 @@ class IFLandmarkTrainer:
     def request_save(self):
         self._save_event.set()
 
+    @staticmethod
+    def _check_temporal_jumps(data_dir: Path) -> None:
+        import glob as _glob
+        data_dir = Path(data_dir)
+        files = sorted(_glob.glob(str(data_dir / '*.json')))
+        _MAX_SCAN = 2000
+        if len(files) > _MAX_SCAN:
+            _logger.info(f"时序跳变检测: 文件数 {len(files)} > {_MAX_SCAN}, 仅扫描前 {_MAX_SCAN} 个")
+            files = files[:_MAX_SCAN]
+        seq_items = []
+        for f in files:
+            try:
+                ann = json.loads(Path(f).read_text(encoding='utf-8'))
+            except Exception:
+                continue
+            src = ann.get('source_filename', Path(f).stem)
+            base = src.rsplit('.', 1)[0]
+            if base.isdigit():
+                lm = ann.get('landmarks_106')
+                bbox = ann.get('bbox')
+                if lm is None or bbox is None:
+                    continue
+                seq_items.append({
+                    'file': Path(f).stem, 'frame': int(base),
+                    'lm': np.asarray(lm, dtype=np.float32),
+                    'bbox': np.asarray(bbox, dtype=np.float32),
+                })
+        if len(seq_items) < 2:
+            return
+        seq_items.sort(key=lambda it: it['frame'])
+        max_gap = 5
+        thresh_norm = 0.06
+        thresh_max_px = 0.15
+        jumps = []
+        for i in range(len(seq_items) - 1):
+            a, b = seq_items[i], seq_items[i + 1]
+            gap = b['frame'] - a['frame']
+            if gap > max_gap:
+                continue
+            d = np.linalg.norm(a['lm'] - b['lm'], axis=1)
+            w = (max(a['bbox'][2] - a['bbox'][0], 1.0) + max(b['bbox'][2] - b['bbox'][0], 1.0)) / 2
+            avg_n = d.mean() / w
+            max_n = d.max() / w
+            if avg_n > thresh_norm or max_n > thresh_max_px:
+                jumps.append((a['file'], b['file'], gap, float(avg_n), float(max_n)))
+        if jumps:
+            _logger.warning(f"时序跳变检测: 发现 {len(jumps)} 对可疑标注跳变 (帧号差<={max_gap} 但位移异常):")
+            for j in jumps[:10]:
+                _logger.warning(f"  {j[0]} -> {j[1]} (Δ{j[2]}帧) 平均{j[3]*100:.1f}%脸宽 最大{j[4]*100:.1f}%")
+            if len(jumps) > 10:
+                _logger.warning(f"  ...还有 {len(jumps) - 10} 对未显示")
+        else:
+            _logger.info(f"时序跳变检测: {len(seq_items)} 张数字序数据, 未发现可疑跳变")
+
     def train(
         self,
         data_dir: Path,
@@ -75,6 +129,8 @@ class IFLandmarkTrainer:
         augment: bool = True,
         pretrained_onnx: Optional[str] = None,
         loss_type: str = "wing",
+        deform_aug: bool = False,
+        finetune_mode: bool = False,
         on_epoch: Optional[Callable[[int, float, float], None]] = None,
         on_preview: Optional[Callable[[np.ndarray], None]] = None,
         on_save: Optional[Callable[[int], None]] = None,
@@ -88,24 +144,47 @@ class IFLandmarkTrainer:
 
         start_epoch = 0
         restored_lr_steps = None
+        restored_last_lr = None
+        restored_lr = None
+        restored_dataset_size = None
         ts_pth = Path(model_dir) / "IFLandmark_training_state.json"
         if ts_pth.exists():
             try:
                 ts = json.loads(ts_pth.read_text(encoding='utf-8'))
                 start_epoch = ts.get('iter', 0)
                 restored_lr_steps = ts.get('lr_steps')
+                restored_last_lr = ts.get('last_lr')
+                restored_lr = ts.get('learning_rate')
+                restored_dataset_size = ts.get('dataset_size')
             except Exception:
                 pass
 
-        lr_steps = [
-            start_epoch + int(0.50 * max_epochs),
-            start_epoch + int(0.83 * max_epochs),
-            start_epoch + int(0.93 * max_epochs),
-        ]
+        if start_epoch > 0:
+            _logger.info(f"续训(resume_from): 从 epoch {start_epoch} 恢复")
+        is_finetune = finetune_mode
+        effective_lr = learning_rate * 0.1 if is_finetune else learning_rate
+        if is_finetune:
+            if deform_aug:
+                _logger.info(f"微调(非刚性形变): lr {learning_rate} → {effective_lr}, 分阶段+DeformAug+TPS+Cutout")
+            else:
+                _logger.info(f"微调(刚性): lr {learning_rate} → {effective_lr}, 分阶段训练, 全点回归")
+
+        target_epoch = start_epoch + max_epochs
+        if start_epoch > 0 and restored_lr_steps and not all(s <= start_epoch for s in restored_lr_steps):
+            lr_steps = restored_lr_steps
+            _logger.info(f"续训: 复用lr_steps={lr_steps}")
+        else:
+            lr_steps = [
+                start_epoch + int(0.50 * max_epochs),
+                start_epoch + int(0.83 * max_epochs),
+                start_epoch + int(0.93 * max_epochs),
+            ]
+            if start_epoch > 0 and restored_lr_steps:
+                _logger.info(f"续训: 重置lr_steps={lr_steps} (已过全部衰减点)")
 
         config = IFLandmarkTrainingConfig(
             batch_size=batch_size,
-            learning_rate=learning_rate,
+            learning_rate=effective_lr,
             max_epochs=max_epochs,
             augment=augment,
             input_size=_INPUT_SIZE,
@@ -120,22 +199,14 @@ class IFLandmarkTrainer:
         optimizer = if_model.get_optimizers_dict()['if_opt']
         scheduler = if_model._scheduler
 
-        if start_epoch > 0 and restored_lr_steps:
-            config.lr_steps = restored_lr_steps
-            for pg in optimizer.param_groups:
-                pg['lr'] = pg['initial_lr'] * (0.1 ** len([m for m in restored_lr_steps if m <= scheduler.last_epoch]))
-            _logger.info(f"续训: 复用上次lr_steps={restored_lr_steps}")
-        if_model.get_aux_state()['lr_steps'] = config.lr_steps
-
         restored_loss = if_model.get_aux_state().get('loss_history', [])
         if restored_loss:
             self._loss_history = restored_loss
+        if_model.get_aux_state()['lr_steps'] = lr_steps
+        if_model.get_aux_state()['learning_rate'] = learning_rate
 
-        if pretrained_onnx and not start_epoch:
-            try:
-                net.load_pretrained_onnx(pretrained_onnx)
-            except Exception as e:
-                _logger.warning(f"加载预训练权重失败: {e}")
+        if is_finetune and start_epoch == 0:
+            net.load_pretrained_onnx(pretrained_onnx)
 
         from faceswap.models.if_landmark.if_landmark_loss import IFLandmarkLoss
         loss_fn = IFLandmarkLoss(loss_type=loss_type, warmup_ratio=0.2).to(device)
@@ -144,7 +215,11 @@ class IFLandmarkTrainer:
             data_dir=Path(data_dir),
             augment=augment,
             input_size=_INPUT_SIZE,
+            is_finetune=is_finetune,
+            deform_aug=deform_aug,
+            full_regression=not deform_aug,
         )
+        if_model.get_aux_state()['dataset_size'] = len(dataset)
 
         is_gpu = is_gpu_device(device)
         n_workers = get_num_workers(device)
@@ -172,15 +247,77 @@ class IFLandmarkTrainer:
         last_save_time = time.time()
         smooth_loss = deque(maxlen=100)
 
-        _logger.info(f"训练参数: max_epochs={max_epochs}, batch_size={batch_size}, lr={learning_rate}, start_epoch={start_epoch}, lr_steps={lr_steps}")
+        _logger.info(f"训练参数: max_epochs={max_epochs}, batch_size={batch_size}, lr={effective_lr}, start_epoch={start_epoch}, target_epoch={target_epoch}, lr_steps={config.lr_steps}")
         if start_epoch > 0:
-            _logger.info(f"续训: 从第 {start_epoch} 轮开始，额外训练 {max_epochs} 轮 (到第 {start_epoch + max_epochs} 轮)")
+            _logger.info(f"续训: 从 epoch {start_epoch} 训练 {max_epochs} 轮 (到 epoch {target_epoch})")
 
-        for epoch in range(start_epoch, start_epoch + max_epochs):
+        if deform_aug and is_finetune:
+            self._check_temporal_jumps(Path(data_dir))
+
+        trained_epochs = 0
+        if start_epoch == 0:
+            try:
+                if_model.create_backup()
+            except Exception as e:
+                _logger.warning(f"训练前自动备份失败: {e}")
+
+        if is_finetune and start_epoch == 0:
+            stage1_end = int(max_epochs * 0.4)
+        else:
+            stage1_end = 0
+        stage2_lr = effective_lr * 0.1
+        resume_hold_lr = False
+        if start_epoch > 0 and is_finetune:
+            lr_changed = restored_lr is None or abs(learning_rate - restored_lr) / max(abs(restored_lr), 1e-9) >= 1e-2
+            dataset_changed = restored_dataset_size is None or len(dataset) != restored_dataset_size
+            if not lr_changed and not dataset_changed and restored_last_lr is not None:
+                stage2_lr = restored_last_lr
+                resume_hold_lr = True
+            elif dataset_changed:
+                _logger.info(f"数据集变化({restored_dataset_size}→{len(dataset)}), 从stage2_lr基准重新衰减")
+            elif lr_changed:
+                _logger.info(f"lr变化({restored_lr}→{learning_rate}), 从stage2_lr基准重新衰减")
+        if is_finetune and max_epochs > 0:
+            if stage1_end > 0:
+                _logger.info(
+                    f"分阶段微调: 阶段1(冻结conv,BN eval,只训fc1,lr={effective_lr:.6f}) "
+                    f"epoch {start_epoch}-{stage1_end}, "
+                    f"阶段2(全解冻,BN train,lr={stage2_lr:.6f}) epoch {stage1_end}-{target_epoch}")
+            else:
+                _logger.info(
+                    f"微调续训: 直接阶段2(全解冻,BN train,lr={stage2_lr:.6f}) "
+                    f"epoch {start_epoch}-{target_epoch}")
+
+        for epoch in range(start_epoch, target_epoch):
             if self._stop_event.is_set():
                 break
 
             net.train()
+            if is_finetune:
+                if epoch < stage1_end:
+                    for name, param in net.named_parameters():
+                        param.requires_grad = name.startswith('fc1')
+                    for m in net.modules():
+                        if isinstance(m, nn.BatchNorm2d):
+                            m.eval()
+                else:
+                    if epoch == stage1_end and stage1_end > start_epoch:
+                        _logger.info(f"阶段2开始: 解冻全部参数, BN恢复训练, lr={stage2_lr:.6f}")
+                    for param in net.parameters():
+                        param.requires_grad = True
+                    s2_len = max(target_epoch - stage1_end, 1)
+                    s2_pos = (epoch - stage1_end) / s2_len
+                    if resume_hold_lr:
+                        lr_now = stage2_lr
+                    else:
+                        lr_now = stage2_lr
+                        if s2_pos >= 0.8:
+                            lr_now = stage2_lr * 0.01
+                        elif s2_pos >= 0.5:
+                            lr_now = stage2_lr * 0.1
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = lr_now
+                    if_model.get_aux_state()['last_lr'] = lr_now
             epoch_losses = []
             for batch_idx, batch in enumerate(loader):
                 if self._stop_event.is_set():
@@ -192,9 +329,10 @@ class IFLandmarkTrainer:
 
                 optimizer.zero_grad()
                 pred = net(images)
-                progress = epoch / max(start_epoch + max_epochs - 1, 1)
+                progress = (epoch - start_epoch) / max(max_epochs - 1, 1)
                 loss = loss_fn(pred, labels, progress=progress, visible=visibles)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=10.0)
                 optimizer.step()
 
                 loss_val = loss.item()
@@ -210,13 +348,13 @@ class IFLandmarkTrainer:
                         child_mem = sum(c.memory_info().rss for c in children)
                         total_mb = (proc.memory_info().rss + child_mem) / 1024**2
                         _logger.info(
-                            f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  batch {batch_idx}/{n_batches}  "
+                            f"Epoch {epoch + 1}/{target_epoch}  batch {batch_idx}/{n_batches}  "
                             f"loss={loss_val:.6f}  lr={optimizer.param_groups[0]['lr']:.6f}  "
                             f"vis={vis_rate:.2%}  "
                             f"mem={total_mb:.0f}MB(workers={len(children)})")
                     except Exception:
                         _logger.info(
-                            f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  batch {batch_idx}/{n_batches}  "
+                            f"Epoch {epoch + 1}/{target_epoch}  batch {batch_idx}/{n_batches}  "
                             f"loss={loss_val:.6f}  lr={optimizer.param_groups[0]['lr']:.6f}  "
                             f"vis={vis_rate:.2%}")
 
@@ -253,7 +391,8 @@ class IFLandmarkTrainer:
                     preview_img = self._generate_preview(net, dataset, device)
                     on_preview(preview_img)
 
-            scheduler.step()
+            if not (is_finetune and epoch >= stage1_end):
+                scheduler.step()
             avg_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
             smooth_avg = float(np.mean(smooth_loss)) if smooth_loss else 0.0
             self._loss_history.append([epoch, avg_loss])
@@ -264,7 +403,7 @@ class IFLandmarkTrainer:
                 on_epoch(epoch + 1 - start_epoch, avg_loss, current_lr)
 
             _logger.info(
-                f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  loss={avg_loss:.6f}  "
+                f"Epoch {epoch + 1}/{target_epoch}  loss={avg_loss:.6f}  "
                 f"smooth={smooth_avg:.6f}  lr={current_lr:.6f}")
 
             if_model.get_aux_state()['iter_count'] = epoch + 1
@@ -273,14 +412,17 @@ class IFLandmarkTrainer:
             if on_save is not None:
                 on_save(epoch + 1)
             last_save_time = time.time()
+            trained_epochs += 1
 
-        if not self._stop_event.is_set():
+        if not self._stop_event.is_set() and trained_epochs > 0:
             onnx_path = Path(model_dir) / "if_landmark_2d106.onnx"
             try:
                 if_model.export_onnx(onnx_path)
                 _logger.info(f"ONNX model exported to {onnx_path}")
             except Exception as e:
                 _logger.warning(f"ONNX export failed: {e}")
+        elif trained_epochs == 0:
+            _logger.warning(f"训练0轮，跳过ONNX导出。当前epoch={start_epoch}，如需继续训练请保持max_epochs={max_epochs}。")
 
         try:
             it = getattr(loader, '_iterator', None)
@@ -299,6 +441,8 @@ class IFLandmarkTrainer:
         device: torch.device,
     ) -> np.ndarray:
         was_training = net.training
+        bn_eval_modules = [m for m in net.modules()
+                           if isinstance(m, nn.BatchNorm2d) and not m.training]
         net.eval()
         n_samples = min(4, len(dataset))
         indices = np.random.choice(len(dataset), n_samples, replace=False)
@@ -362,6 +506,8 @@ class IFLandmarkTrainer:
 
         if was_training:
             net.train()
+        for m in bn_eval_modules:
+            m.eval()
         return canvas
 
     def generate_loss_chart(self, width: int = 600, height: int = 200) -> np.ndarray:

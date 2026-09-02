@@ -74,6 +74,8 @@ class SCRFDTrainer:
         max_epochs: int = 30,
         augment: bool = True,
         pretrained_onnx: Optional[str] = None,
+        deform_aug: bool = False,
+        finetune_mode: bool = False,
         on_epoch: Optional[Callable[[int, float, float], None]] = None,
         on_preview: Optional[Callable[[np.ndarray], None]] = None,
         on_save: Optional[Callable[[int], None]] = None,
@@ -86,34 +88,50 @@ class SCRFDTrainer:
         configure_torch("gpu_train" if is_gpu_device(device) else "cpu_train")
 
         start_epoch = 0
-        restored_lr_step_epochs = None
+        restored_lr_steps = None
+        restored_last_lr = None
+        restored_lr = None
+        restored_dataset_size = None
         ts_pth = Path(model_dir) / "SCRFD_training_state.json"
         if ts_pth.exists():
             try:
                 ts = json.loads(ts_pth.read_text(encoding='utf-8'))
                 start_epoch = ts.get('iter', 0)
-                restored_lr_step_epochs = ts.get('lr_step_epochs')
+                restored_lr_steps = ts.get('lr_steps')
+                restored_last_lr = ts.get('last_lr')
+                restored_lr = ts.get('learning_rate')
+                restored_dataset_size = ts.get('dataset_size')
             except Exception:
                 pass
 
-        if start_epoch > 0 and restored_lr_step_epochs:
-            lr_step_epochs = restored_lr_step_epochs
-            _logger.info(f"续训: 复用上次lr_step_epochs={lr_step_epochs}")
+        if start_epoch > 0:
+            _logger.info(f"续训(resume_from): 从 epoch {start_epoch} 恢复")
+        is_finetune = finetune_mode
+        effective_lr = learning_rate * 0.1 if is_finetune else learning_rate
+        if is_finetune:
+            if deform_aug:
+                _logger.info(f"微调(非刚性形变): lr {learning_rate} → {effective_lr}, 分阶段+DeformAug")
+            else:
+                _logger.info(f"微调(刚性): lr {learning_rate} → {effective_lr}, 分阶段训练")
+
+        target_epoch = start_epoch + max_epochs
+        if start_epoch > 0 and restored_lr_steps and not all(s <= start_epoch for s in restored_lr_steps):
+            lr_steps = restored_lr_steps
+            _logger.info(f"续训: 复用lr_steps={lr_steps}")
         else:
-            lr_step_epochs = [
-                start_epoch + int(0.67 * max_epochs),
-                start_epoch + int(0.90 * max_epochs),
-            ]
+            lr_steps = [start_epoch + int(0.67 * max_epochs), start_epoch + int(0.90 * max_epochs)]
+            if start_epoch > 0 and restored_lr_steps:
+                _logger.info(f"续训: 重置lr_steps={lr_steps} (已过全部衰减点)")
 
         config = SCRFDTrainingConfig(
             batch_size=batch_size,
-            learning_rate=learning_rate,
+            learning_rate=effective_lr,
             max_epochs=max_epochs,
             augment=augment,
             input_size=_INPUT_SIZE,
             data_dir=str(data_dir),
             pretrained_onnx=pretrained_onnx or '',
-            lr_step_epochs=lr_step_epochs,
+            lr_step_epochs=lr_steps,
         )
 
         scrfd_model = SCRFDModel(config, Path(model_dir), device)
@@ -123,18 +141,11 @@ class SCRFDTrainer:
         restored_loss = scrfd_model.get_aux_state().get('loss_history', [])
         if restored_loss:
             self._loss_history = restored_loss
+        scrfd_model.get_aux_state()['lr_steps'] = lr_steps
+        scrfd_model.get_aux_state()['learning_rate'] = learning_rate
 
-        is_finetune = False
-        if pretrained_onnx and not start_epoch:
-            try:
-                net.load_pretrained_onnx(pretrained_onnx)
-                is_finetune = True
-            except Exception as e:
-                _logger.warning(f"Failed to load pretrained ONNX: {e}")
-        if start_epoch > 0:
-            is_finetune = scrfd_model.get_aux_state().get('is_finetune', False)
-        scrfd_model.get_aux_state()['is_finetune'] = is_finetune
-        scrfd_model.get_aux_state()['lr_step_epochs'] = lr_step_epochs
+        if is_finetune and start_epoch == 0:
+            net.load_pretrained_onnx(pretrained_onnx)
 
         loss_fn = SCRFDLoss(input_size=_INPUT_SIZE).to(device)
 
@@ -142,7 +153,10 @@ class SCRFDTrainer:
             data_dir=Path(data_dir),
             augment=augment,
             input_size=_INPUT_SIZE,
+            is_finetune=is_finetune,
+            deform_aug=deform_aug,
         )
+        scrfd_model.get_aux_state()['dataset_size'] = len(dataset)
 
         is_gpu = is_gpu_device(device)
         n_workers = get_num_workers(device)
@@ -166,18 +180,14 @@ class SCRFDTrainer:
 
         warmup_iters = min(config.warmup_iters, len(dataset) * max_epochs // (batch_size * 3))
         warmup_ratio = config.warmup_ratio
-        base_lr = learning_rate
+        base_lr = effective_lr
         global_iter = start_epoch * len(loader)
 
         last_save_time = time.time()
         smooth_loss = deque(maxlen=100)
 
         if is_finetune:
-            for m in net.modules():
-                if isinstance(m, nn.BatchNorm2d):
-                    m.weight.requires_grad = False
-                    m.bias.requires_grad = False
-            _logger.info("Finetune: BN frozen (identity), all other layers trainable with layerwise lr")
+            _logger.info("微调: layerwise lr, 分阶段训练")
 
             groups = {'backbone': [], 'neck': [], 'convs': [], 'preds': []}
             for name, param in net.named_parameters():
@@ -204,7 +214,7 @@ class SCRFDTrainer:
                     _logger.info(f"  {key}: {len(groups[key])} params, lr_mult={lr_mults[key]}")
             optimizer = torch.optim.SGD(param_groups, momentum=0.9, weight_decay=0.0005)
         else:
-            _logger.info("From-scratch: all layers trainable with uniform lr")
+            _logger.info("训练: 所有层统一lr, BN正常训练")
             optimizer = torch.optim.SGD(
                 net.parameters(),
                 lr=base_lr, momentum=0.9, weight_decay=0.0005,
@@ -216,30 +226,97 @@ class SCRFDTrainer:
                 try:
                     opt_state = torch.load(opt_pth, map_location=device, weights_only=False)
                     optimizer.load_state_dict(opt_state)
-                    _logger.info(f"Restored optimizer state from {opt_pth.name}")
+                    _logger.info(f"恢复optimizer状态: {opt_pth.name}")
                 except Exception as e:
-                    _logger.warning(f"Failed to restore optimizer state: {e}")
+                    _logger.warning(f"恢复optimizer状态失败: {e}")
+
         scrfd_model.register_optimizer('scrfd_opt', optimizer)
 
-        _logger.info(f"训练参数: max_epochs={max_epochs}, batch_size={batch_size}, lr={learning_rate}, start_epoch={start_epoch}, lr_step_epochs={lr_step_epochs}")
+        _logger.info(f"训练参数: max_epochs={max_epochs}, batch_size={batch_size}, lr={base_lr}, start_epoch={start_epoch}, target_epoch={target_epoch}, lr_steps={lr_steps}")
         if start_epoch > 0:
-            _logger.info(f"续训: 从第 {start_epoch} 轮开始，额外训练 {max_epochs} 轮 (到第 {start_epoch + max_epochs} 轮)")
+            _logger.info(f"续训: 从 epoch {start_epoch} 训练 {max_epochs} 轮 (到 epoch {target_epoch})")
 
-        for epoch in range(start_epoch, start_epoch + max_epochs):
+        trained_epochs = 0
+        if start_epoch == 0:
+            try:
+                scrfd_model.create_backup()
+            except Exception as e:
+                _logger.warning(f"训练前自动备份失败: {e}")
+
+        if is_finetune and start_epoch == 0:
+            stage1_end = int(max_epochs * 0.4)
+        else:
+            stage1_end = 0
+        stage2_lr = effective_lr * 0.1
+        resume_hold_lr = False
+        if start_epoch > 0 and is_finetune:
+            lr_changed = restored_lr is None or abs(learning_rate - restored_lr) / max(abs(restored_lr), 1e-9) >= 1e-2
+            dataset_changed = restored_dataset_size is None or len(dataset) != restored_dataset_size
+            if not lr_changed and not dataset_changed and restored_last_lr is not None:
+                stage2_lr = restored_last_lr
+                resume_hold_lr = True
+            elif dataset_changed:
+                _logger.info(f"数据集变化({restored_dataset_size}→{len(dataset)}), 从stage2_lr基准重新衰减")
+            elif lr_changed:
+                _logger.info(f"lr变化({restored_lr}→{learning_rate}), 从stage2_lr基准重新衰减")
+        if is_finetune and max_epochs > 0:
+            if stage1_end > 0:
+                _logger.info(
+                    f"分阶段微调: 阶段1(冻结backbone+neck,BN eval,layerwise lr) "
+                    f"epoch {start_epoch}-{stage1_end}, "
+                    f"阶段2(全解冻,BN eval恒等,lr={stage2_lr:.6f}) epoch {stage1_end}-{target_epoch}")
+            else:
+                _logger.info(
+                    f"微调续训: 直接阶段2(全解冻,BN eval恒等,lr={stage2_lr:.6f}) "
+                    f"epoch {start_epoch}-{target_epoch}")
+
+        for epoch in range(start_epoch, target_epoch):
             if self._stop_event.is_set():
                 break
 
-            if global_iter >= warmup_iters:
-                decay = 0.1 ** len([m for m in config.lr_step_epochs if m <= epoch])
-                for pg in optimizer.param_groups:
-                    lr_mult = pg.get('lr_mult', 1.0)
-                    pg['lr'] = base_lr * lr_mult * decay
-
             net.train()
             if is_finetune:
-                for m in net.modules():
-                    if isinstance(m, nn.BatchNorm2d):
-                        m.eval()
+                if epoch < stage1_end:
+                    for name, param in net.named_parameters():
+                        if 'backbone' in name or 'neck' in name:
+                            param.requires_grad = False
+                        else:
+                            param.requires_grad = True
+                    for m in net.modules():
+                        if isinstance(m, nn.BatchNorm2d):
+                            m.eval()
+                    if global_iter >= warmup_iters:
+                        decay = 0.1 ** len([s for s in lr_steps if s <= epoch])
+                        for pg in optimizer.param_groups:
+                            lr_mult = pg.get('lr_mult', 1.0)
+                            pg['lr'] = base_lr * lr_mult * decay
+                else:
+                    if epoch == stage1_end and stage1_end > 0:
+                        _logger.info(f"阶段2开始: 解冻全部参数, BN保持eval, lr={stage2_lr:.6f}")
+                    for param in net.parameters():
+                        param.requires_grad = True
+                    for m in net.modules():
+                        if isinstance(m, nn.BatchNorm2d):
+                            m.eval()
+                    s2_len = max(target_epoch - stage1_end, 1)
+                    s2_pos = (epoch - stage1_end) / s2_len
+                    if resume_hold_lr:
+                        lr_now = stage2_lr
+                    else:
+                        lr_now = stage2_lr
+                        if s2_pos >= 0.8:
+                            lr_now = stage2_lr * 0.01
+                        elif s2_pos >= 0.5:
+                            lr_now = stage2_lr * 0.1
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = lr_now
+                    scrfd_model.get_aux_state()['last_lr'] = lr_now
+            else:
+                if global_iter >= warmup_iters:
+                    decay = 0.1 ** len([s for s in lr_steps if s <= epoch])
+                    for pg in optimizer.param_groups:
+                        lr_mult = pg.get('lr_mult', 1.0)
+                        pg['lr'] = base_lr * lr_mult * decay
             epoch_losses = []
             for batch_idx, batch in enumerate(loader):
                 if self._stop_event.is_set():
@@ -250,7 +327,7 @@ class SCRFDTrainer:
                 gt_labels = [l.to(device) for l in batch['gt_labels']]
                 gt_keypointss = [k.to(device) for k in batch['gt_keypointss']]
 
-                if global_iter < warmup_iters:
+                if start_epoch == 0 and global_iter < warmup_iters:
                     warmup_factor = (warmup_ratio + (1 - warmup_ratio) * global_iter / warmup_iters)
                     for pg in optimizer.param_groups:
                         lr_mult = pg.get('lr_mult', 1.0)
@@ -278,12 +355,12 @@ class SCRFDTrainer:
                         child_mem = sum(c.memory_info().rss for c in children)
                         total_mb = (proc.memory_info().rss + child_mem) / 1024**2
                         _logger.info(
-                            f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  batch {batch_idx}/{n_batches}  "
+                            f"Epoch {epoch + 1}/{target_epoch}  batch {batch_idx}/{n_batches}  "
                             f"loss={loss_val:.6f}  lr={optimizer.param_groups[-1]['lr']:.6f}  "
                             f"mem={total_mb:.0f}MB(workers={len(children)})")
                     except Exception:
                         _logger.info(
-                            f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  batch {batch_idx}/{n_batches}  "
+                            f"Epoch {epoch + 1}/{target_epoch}  batch {batch_idx}/{n_batches}  "
                             f"loss={loss_val:.6f}  lr={optimizer.param_groups[-1]['lr']:.6f}")
 
                 if self._preview_event.is_set():
@@ -323,7 +400,7 @@ class SCRFDTrainer:
                 on_epoch(epoch + 1 - start_epoch, avg_loss, current_lr)
 
             _logger.info(
-                f"Epoch {epoch + 1 - start_epoch}/{max_epochs}  loss={avg_loss:.6f}  "
+                f"Epoch {epoch + 1}/{target_epoch}  loss={avg_loss:.6f}  "
                 f"smooth={smooth_avg:.6f}  lr={current_lr:.6f}")
 
             scrfd_model.get_aux_state()['iter_count'] = epoch + 1
@@ -332,14 +409,17 @@ class SCRFDTrainer:
             if on_save is not None:
                 on_save(epoch + 1)
             last_save_time = time.time()
+            trained_epochs += 1
 
-        if not self._stop_event.is_set():
+        if not self._stop_event.is_set() and trained_epochs > 0:
             onnx_path = Path(model_dir) / "scrfd_custom.onnx"
             try:
                 scrfd_model.export_onnx(onnx_path)
                 _logger.info(f"ONNX model exported to {onnx_path}")
             except Exception as e:
                 _logger.warning(f"ONNX export failed: {e}")
+        elif trained_epochs == 0:
+            _logger.warning(f"训练0轮，跳过ONNX导出。当前epoch={start_epoch}，如需继续训练请保持max_epochs={max_epochs}。")
 
         try:
             it = getattr(loader, '_iterator', None)
@@ -360,6 +440,9 @@ class SCRFDTrainer:
         net.eval()
         n_samples = min(4, len(dataset))
         indices = np.random.choice(len(dataset), n_samples, replace=False)
+
+        bn_eval_modules = [m for m in net.modules()
+                           if isinstance(m, nn.BatchNorm2d) and not m.training]
 
         _PREVIEW_SIZE = 320
         cell_size = _PREVIEW_SIZE
@@ -416,7 +499,7 @@ class SCRFDTrainer:
                     cv2.circle(padded, (int(gt_kps[k, 0]), int(gt_kps[k, 1])), 3, (0, 255, 0), -1)
 
                 dets, kpss = scrfd_detect(net, img, input_size=_INPUT_SIZE,
-                                         det_thresh=0.5, nms_thresh=0.4)
+                                         det_thresh=0.5, nms_thresh=0.45)
                 for j in range(len(dets)):
                     x1, y1, x2, y2, score = dets[j]
                     if x2 < x_lo or x1 > x_hi or y2 < y_lo or y1 > y_hi:
@@ -438,6 +521,8 @@ class SCRFDTrainer:
                 canvas[y0:y0 + cell_size, x0:x0 + cell_size] = padded
 
         net.train()
+        for m in bn_eval_modules:
+            m.eval()
         return canvas
 
     def generate_loss_chart(self, width: int = 600, height: int = 200) -> np.ndarray:

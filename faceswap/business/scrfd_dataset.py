@@ -17,6 +17,7 @@ _INPUT_SIZE = 640
 _NUM_KPS = 5
 _KPS_FLIP_ORDER = [1, 0, 2, 4, 3]
 _CROP_CHOICES = [0.3, 0.45, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+_CROP_CHOICES_FINETUNE = [0.8, 1.0, 1.2, 1.4]
 _IMAGE_CACHE_MAX = 256
 
 
@@ -148,12 +149,17 @@ class SCRFDDataset(Dataset):
         data_dir: Path,
         augment: bool = True,
         input_size: int = _INPUT_SIZE,
+        is_finetune: bool = False,
+        deform_aug: bool = False,
     ):
         self._data_dir = Path(data_dir)
         self._augment = augment
         self._input_size = input_size
+        self._crop_choices = _CROP_CHOICES_FINETUNE if is_finetune else _CROP_CHOICES
         self._image_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._samples: list[tuple[Path, np.ndarray, np.ndarray]] = []
+
+        self._deform_aug = deform_aug
         self._scan()
 
         if len(self._samples) == 0:
@@ -203,6 +209,63 @@ class SCRFDDataset(Dataset):
     def __len__(self) -> int:
         return len(self._samples)
 
+    def _apply_deform(self, img, bboxes, keypointss):
+        H, W = img.shape[:2]
+        for i in range(len(bboxes)):
+            x1, y1, x2, y2 = bboxes[i]
+            fw = max(x2 - x1, 1.0)
+            fh = max(y2 - y1, 1.0)
+            if random.random() < 0.25:
+                cx = random.uniform(x1, x2)
+                cy = random.uniform(y1 + fh * 0.3, y2)
+                rx = random.uniform(fw * 0.15, fw * 0.4)
+                ry = rx * random.uniform(0.7, 1.2)
+                angle = random.uniform(0, 180)
+                angle_rad = angle * np.pi / 180.0
+                box_half_w = np.sqrt(rx**2 * np.cos(angle_rad)**2 + ry**2 * np.sin(angle_rad)**2)
+                box_half_h = np.sqrt(rx**2 * np.sin(angle_rad)**2 + ry**2 * np.cos(angle_rad)**2)
+                bx1 = max(0, int(cx - box_half_w))
+                by1 = max(0, int(cy - box_half_h))
+                bx2 = min(W, int(cx + box_half_w) + 1)
+                by2 = min(H, int(cy + box_half_h) + 1)
+                bw = bx2 - bx1
+                bh = by2 - by1
+                if bw > 0 and bh > 0:
+                    mask = np.zeros((bh, bw), dtype=np.uint8)
+                    cv2.ellipse(mask, (int(cx - bx1), int(cy - by1)), (int(rx), int(ry)),
+                                angle, 0, 360, 255, -1)
+                    color = np.random.randint(70, 200, 3).tolist()
+                    noise = np.random.normal(0, 18, (bh, bw, 3))
+                    occ = np.clip(color + noise, 0, 255).astype(np.uint8)
+                    img = img.copy()
+                    sub = img[by1:by2, bx1:bx2]
+                    sub[mask > 0] = occ[mask > 0]
+                    img[by1:by2, bx1:bx2] = sub
+                    for j in range(_NUM_KPS):
+                        kx, ky = int(keypointss[i, j, 0]), int(keypointss[i, j, 1])
+                        if bx1 <= kx < bx2 and by1 <= ky < by2 and mask[ky - by1, kx - bx1] > 0:
+                            keypointss[i, j, 2] = 0.0
+            if random.random() < 0.25:
+                mouth_l = keypointss[i, 3, :2]
+                mouth_r = keypointss[i, 4, :2]
+                x_mid = (mouth_l[0] + mouth_r[0]) / 2
+                y_mid = (mouth_l[1] + mouth_r[1]) / 2
+                open_amt = random.uniform(3.0, 12.0) * (fh / 192.0)
+                R = max(16.0, fh * 0.3)
+                yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+                d = np.sqrt((xx - x_mid) ** 2 + (yy - y_mid) ** 2)
+                w = np.clip(1.0 - d / R, 0, 1) ** 1.5
+                dy_field = np.sign(yy - y_mid) * open_amt * w
+                dy_field = cv2.GaussianBlur(dy_field, (0, 0), 2.0).astype(np.float32)
+                map_y = (yy - dy_field).astype(np.float32)
+                img = cv2.remap(img, xx, map_y, cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_REPLICATE)
+                for j in range(_NUM_KPS):
+                    kx = int(np.clip(keypointss[i, j, 0], 0, W - 1))
+                    ky = int(np.clip(keypointss[i, j, 1], 0, H - 1))
+                    keypointss[i, j, 1] += dy_field[ky, kx]
+        return img, bboxes, keypointss
+
     def __getitem__(self, index: int) -> dict:
         img_path, bbox, kps = self._samples[index]
         img = self._read_image(img_path)
@@ -217,7 +280,7 @@ class SCRFDDataset(Dataset):
         keypointss[:, :, 2] = 1.0
 
         if self._augment:
-            img, bboxes, keypointss = _random_square_crop(img, bboxes, keypointss)
+            img, bboxes, keypointss = _random_square_crop(img, bboxes, keypointss, crop_choices=self._crop_choices)
 
         crop_h, crop_w = img.shape[:2]
         scale = self._input_size / max(crop_h, crop_w)
@@ -237,6 +300,9 @@ class SCRFDDataset(Dataset):
         if self._augment:
             img, bboxes, keypointss, _ = _random_flip(img, bboxes, keypointss)
             img = _photo_metric_distortion(img)
+
+        if self._deform_aug and self._augment:
+            img, bboxes, keypointss = self._apply_deform(img, bboxes, keypointss)
 
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = img.astype(np.float32)

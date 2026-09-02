@@ -60,7 +60,7 @@ def _trans_points(pts: np.ndarray, M: np.ndarray) -> np.ndarray:
     return new_pts
 
 
-def _build_augment(augment: bool) -> "A.ReplayCompose":
+def _build_augment(augment: bool, is_finetune: bool = False) -> "A.ReplayCompose":
     transform_list = []
     if augment and _HAS_AUG:
         transform_list += [
@@ -69,13 +69,25 @@ def _build_augment(augment: bool) -> "A.ReplayCompose":
             A.GaussianBlur(blur_limit=(1, 5), p=0.1),
             A.MotionBlur(blur_limit=(3, 7), p=0.1),
             A.ImageCompression(quality_range=(50, 90), p=0.05),
-            A.Affine(
-                translate_percent=0.05, scale=(0.9, 1.1), rotate=20,
-                interpolation=cv2.INTER_LINEAR,
-                border_mode=cv2.BORDER_CONSTANT, fill=0, fill_mask=0, p=0.5,
-            ),
-            A.HorizontalFlip(p=0.5),
         ]
+        if is_finetune:
+            transform_list += [
+                A.Affine(
+                    translate_percent=0.02, scale=(0.95, 1.05), rotate=0,
+                    interpolation=cv2.INTER_LINEAR,
+                    border_mode=cv2.BORDER_CONSTANT, fill=0, fill_mask=0, p=0.3,
+                ),
+                A.HorizontalFlip(p=0.5),
+            ]
+        else:
+            transform_list += [
+                A.Affine(
+                    translate_percent=0.05, scale=(0.9, 1.1), rotate=20,
+                    interpolation=cv2.INTER_LINEAR,
+                    border_mode=cv2.BORDER_CONSTANT, fill=0, fill_mask=0, p=0.5,
+                ),
+                A.HorizontalFlip(p=0.5),
+            ]
     return A.ReplayCompose(
         transform_list,
         keypoint_params=A.KeypointParams(format='xy', remove_invisible=False),
@@ -88,12 +100,21 @@ class IFLandmarkDataset(Dataset):
         data_dir: Path,
         augment: bool = True,
         input_size: int = _INPUT_SIZE,
+        is_finetune: bool = False,
+        deform_aug: bool = False,
+        full_regression: bool = True,
     ):
         self._data_dir = Path(data_dir)
         self._augment = augment and _HAS_AUG
         self._input_size = input_size
-        self._aug = _build_augment(self._augment)
+        self._aug = _build_augment(self._augment, is_finetune=is_finetune)
         self._image_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._full_regression = full_regression
+
+        self._deform_aug = None
+        if deform_aug:
+            from faceswap.models.if_landmark.deform_aug import DeformAug
+            self._deform_aug = DeformAug(size=input_size)
 
         self._samples: list[tuple[Path, np.ndarray, np.ndarray, np.ndarray]] = []
         self._scan()
@@ -129,7 +150,9 @@ class IFLandmarkDataset(Dataset):
             if bbox.shape != (4,):
                 continue
             vis = ann.get("landmarks_106_visibility")
-            if vis is not None and len(vis) == _NUM_LANDMARKS:
+            if self._full_regression:
+                visibility = np.ones(_NUM_LANDMARKS, dtype=bool)
+            elif vis is not None and len(vis) == _NUM_LANDMARKS:
                 visibility = np.asarray(vis, dtype=bool)
             else:
                 visibility = np.ones(_NUM_LANDMARKS, dtype=bool)
@@ -208,6 +231,11 @@ class IFLandmarkDataset(Dataset):
             if flipped:
                 landmarks = landmarks[FLIP_MAP_106, :]
                 visible = visible[FLIP_MAP_106]
+
+        if self._deform_aug is not None:
+            img, landmarks, vis_out = self._deform_aug(img, landmarks, visible)
+            if vis_out is not None:
+                visible = vis_out
 
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = img.astype(np.float32)
