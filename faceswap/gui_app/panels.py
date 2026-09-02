@@ -3061,6 +3061,9 @@ class Step7IFTrain(StepPanel):
         self._dataset_combo.addItem("LaPa", lapa_dir)
         self._params_area.addWidget(self._dataset_combo)
 
+        model_grp = QGroupBox("训练选择")
+        model_vl = QVBoxLayout(model_grp)
+        model_vl.setContentsMargins(8, 12, 8, 8)
         model_row = QHBoxLayout()
         self._train_scrfd_check = QCheckBox("训练SCRFD")
         self._train_scrfd_check.setChecked(True)
@@ -3070,7 +3073,8 @@ class Step7IFTrain(StepPanel):
         self._train_lm_check.setToolTip("勾选后训练106点Landmark模型")
         model_row.addWidget(self._train_scrfd_check)
         model_row.addWidget(self._train_lm_check)
-        self._params_area.addLayout(model_row)
+        model_vl.addLayout(model_row)
+        self._params_area.addWidget(model_grp)
 
         scrfd_grp = QGroupBox("SCRFD参数")
         scrfd_vl = QVBoxLayout(scrfd_grp)
