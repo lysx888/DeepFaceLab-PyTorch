@@ -263,15 +263,26 @@ class SCRFDNet(nn.Module):
         onnx_inits = {init.name: onnx.numpy_helper.to_array(init) for init in m.graph.initializer}
         state_dict = self.state_dict()
         loaded = 0
+        expected = 0
+
+        def _check_shape(arr, pt_key):
+            pt_shape = tuple(state_dict[pt_key].shape)
+            onnx_shape = tuple(arr.shape)
+            if onnx_shape != pt_shape:
+                raise RuntimeError(
+                    f"形状不匹配: {pt_key} 期望 {pt_shape}, ONNX提供 {onnx_shape}")
 
         def _load_bn_folded(onnx_w_id: str, onnx_b_id: str, pt_conv: str, pt_bn: str):
-            nonlocal loaded
+            nonlocal loaded, expected
+            expected += 2
             w = onnx_inits.get(onnx_w_id)
             b = onnx_inits.get(onnx_b_id)
             if w is not None and pt_conv + '.weight' in state_dict:
+                _check_shape(w, pt_conv + '.weight')
                 state_dict[pt_conv + '.weight'] = torch.from_numpy(w.copy())
                 loaded += 1
             if b is not None and pt_bn + '.bias' in state_dict:
+                _check_shape(b, pt_bn + '.bias')
                 state_dict[pt_bn + '.weight'] = torch.ones_like(state_dict[pt_bn + '.weight'])
                 state_dict[pt_bn + '.bias'] = torch.from_numpy(b.copy())
                 state_dict[pt_bn + '.running_mean'] = torch.zeros_like(state_dict[pt_bn + '.running_mean'])
@@ -279,22 +290,27 @@ class SCRFDNet(nn.Module):
                 loaded += 1
 
         def _load_plain_conv(onnx_w_name: str, onnx_b_name: str, pt_conv: str):
-            nonlocal loaded
+            nonlocal loaded, expected
+            expected += 1 + (1 if onnx_b_name else 0)
             w = onnx_inits.get(onnx_w_name)
             b = onnx_inits.get(onnx_b_name) if onnx_b_name else None
             if w is not None and pt_conv + '.weight' in state_dict:
+                _check_shape(w, pt_conv + '.weight')
                 state_dict[pt_conv + '.weight'] = torch.from_numpy(w.copy())
                 loaded += 1
             if b is not None and pt_conv + '.bias' in state_dict:
+                _check_shape(b, pt_conv + '.bias')
                 state_dict[pt_conv + '.bias'] = torch.from_numpy(b.copy())
                 loaded += 1
             elif pt_conv + '.bias' in state_dict:
                 state_dict[pt_conv + '.bias'] = torch.zeros_like(state_dict[pt_conv + '.bias'])
 
         def _load_scalar(onnx_name: str, pt_name: str):
-            nonlocal loaded
+            nonlocal loaded, expected
+            expected += 1
             v = onnx_inits.get(onnx_name)
             if v is not None and pt_name in state_dict:
+                _check_shape(v, pt_name)
                 state_dict[pt_name] = torch.from_numpy(v.copy())
                 loaded += 1
 
@@ -364,10 +380,13 @@ class SCRFDNet(nn.Module):
 
         ds0_bias = onnx_inits.get('neck.downsample_convs.0.conv.bias')
         ds1_bias = onnx_inits.get('neck.downsample_convs.1.conv.bias')
+        expected += 2
         if ds0_bias is not None and 'neck.fpn_convs.1.bias' in state_dict:
+            _check_shape(ds0_bias, 'neck.fpn_convs.1.bias')
             state_dict['neck.fpn_convs.1.bias'] = torch.from_numpy(ds0_bias.copy())
             loaded += 1
         if ds1_bias is not None and 'neck.fpn_convs.2.bias' in state_dict:
+            _check_shape(ds1_bias, 'neck.fpn_convs.2.bias')
             state_dict['neck.fpn_convs.2.bias'] = torch.from_numpy(ds1_bias.copy())
             loaded += 1
 
@@ -389,7 +408,13 @@ class SCRFDNet(nn.Module):
             _load_scalar(f'bbox_head.scales.{i}.scale', f'head.scales.{i}.scale')
 
         self.load_state_dict(state_dict)
-        _logger.info(f"从ONNX加载 {loaded} 个预训练权重: {onnx_path}")
+        ratio = loaded / expected if expected > 0 else 0
+        if ratio < 0.5:
+            raise RuntimeError(
+                f"预训练权重匹配率仅 {loaded}/{expected} ({ratio:.0%})，低于50%阈值。"
+                f"ONNX可能与模型架构不匹配: {onnx_path}")
+        else:
+            _logger.info(f"从ONNX加载预训练权重: {onnx_path} ({loaded}/{expected})")
         return loaded
 
     def export_onnx(self, path: str, input_size: int = 640) -> None:
@@ -482,7 +507,7 @@ def nms(dets, iou_thresh=0.4):
     return keep
 
 
-def scrfd_detect(net, img, input_size=640, det_thresh=0.5, nms_thresh=0.4):
+def scrfd_detect(net, img, input_size=640, det_thresh=0.5, nms_thresh=0.45):
     net.eval()
     device = next(net.parameters()).device
 

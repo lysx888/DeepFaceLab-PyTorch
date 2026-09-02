@@ -366,7 +366,10 @@ class SCRFDLoss(nn.Module):
                 total_loss_cls = total_loss_cls + loss_cls
                 total_loss_bbox = total_loss_bbox + loss_bbox
                 total_loss_kps = total_loss_kps + loss_kps
-                total_pos += weight_targets.sum().item() if len(pos) > 0 else 0.0
+                # 归一化分母 = 正样本数量(各level累计), 而非 cls sigmoid 加权和
+                # (旧版用 weight_targets.sum() ≈ 0.01*N, 导致 bbox/kps loss 被放大 ~100 倍,
+                #  梯度被 kps 主导, 分类头学不到)
+                total_pos += len(pos) if len(pos) > 0 else 0.0
 
         batch_total_pos = max(batch_total_pos, 1)
         total_loss_cls = total_loss_cls / batch_total_pos
