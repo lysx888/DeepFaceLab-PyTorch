@@ -50,10 +50,10 @@ def main():
     p = subparsers.add_parser("extract-faces-src", help="Extract source faces")
     p.add_argument("--input-dir", type=Path, default=DATA_SRC_DIR)
     p.add_argument("--output-dir", type=Path, default=DATA_SRC_ALIGNED_DIR)
-    p.add_argument("--face-type", type=str, default="whole_face", choices=["half", "mid_full", "full", "whole_face", "head"])
+    p.add_argument("--face-type", type=str, default="whole_face", choices=["whole_face", "head"])
     p.add_argument("--max-faces", type=int, default=0)
     p.add_argument("--det-thresh", type=float, default=0.5)
-    p.add_argument("--output-size", type=int, default=512)
+    p.add_argument("--output-size", type=int, default=None)
 
     p = subparsers.add_parser("extract-faces-dst", help="Extract destination faces")
     p.add_argument("--input-dir", type=Path, default=DATA_DST_DIR)
@@ -61,7 +61,7 @@ def main():
     p.add_argument("--face-type", type=str, default="whole_face")
     p.add_argument("--max-faces", type=int, default=0)
     p.add_argument("--det-thresh", type=float, default=0.5)
-    p.add_argument("--output-size", type=int, default=512)
+    p.add_argument("--output-size", type=int, default=None)
     p.add_argument("--debug", action="store_true")
 
     # sorting
@@ -143,9 +143,6 @@ def main():
 
 def _face_type_from_str(s: str) -> FaceType:
     return {
-        "half": FaceType.HALF,
-        "mid_full": FaceType.MID_FULL,
-        "full": FaceType.FULL,
         "whole_face": FaceType.WHOLE_FACE,
         "head": FaceType.HEAD,
     }[s.lower()]
@@ -197,7 +194,6 @@ def _dispatch(args):
         gpu_idx = 0
         from faceswap.shared.config import is_gpu_available
         if is_gpu_available():
-            print(f"\n  [CPU] : CPU")
             if torch.cuda.is_available():
                 gpu_count = torch.cuda.device_count()
                 for i in range(gpu_count):
@@ -218,17 +214,18 @@ def _dispatch(args):
                     pass
 
         try:
-            ft_input = input(f"  Face type ( half/mid_full/full/wf/head ) [{face_type_str}] : ").strip().lower()
+            ft_input = input(f"  Face type ( wf/head ) [{face_type_str}] : ").strip().lower()
         except EOFError:
             ft_input = ""
         if ft_input:
-            ft_map = {"h": "half", "mf": "mid_full", "f": "full", "wf": "whole_face", "head": "head",
-                       "half": "half", "mid_full": "mid_full", "full": "full", "whole_face": "whole_face"}
+            ft_map = {"wf": "whole_face", "head": "head",
+                       "whole_face": "whole_face"}
             face_type_str = ft_map.get(ft_input, face_type_str)
 
         ft = _face_type_from_str(face_type_str)
         default_size = 768 if ft == FaceType.HEAD else 512
-        output_size = default_size
+        if output_size is None:
+            output_size = default_size
 
         try:
             mf_input = input(f"  Max number of faces from image (0=unlimited) [{max_faces}] : ").strip()

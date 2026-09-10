@@ -35,6 +35,7 @@ SAEHD_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "saehd"
 AMP_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "amp"
 QUICK96_MODEL_DIR: Final[Path] = _WORKSPACE_ROOT / "model" / "quick96"
 PRETRAIN_DATA_DIR: Final[Path] = _WORKSPACE_ROOT / "insightface_train" / "pretrain_faces"
+SAEHD_PRETRAIN_DATA_DIR: Final[Path] = _WORKSPACE_ROOT / "pretrain_faces"
 
 INSIGHTFACE_TRAIN_DIR: Final[Path] = _WORKSPACE_ROOT / "insightface_train"
 INSIGHTFACE_MANUAL_ANNOTATED_DIR: Final[Path] = _WORKSPACE_ROOT / "insightface_train" / "manual_annotated"
@@ -59,8 +60,6 @@ ARCFACE_MODEL_PATH: Final[Path] = _WEIGHTS_ROOT / "models" / "antelopev2" / "gli
 ARCFACE_PTH_MODEL_PATH: Final[Path] = _WEIGHTS_ROOT / "models" / "antelopev2" / "glintr100_pt.pth"
 FACE_PARSING_MODEL_PATH: Final[Path] = _WEIGHTS_ROOT / "face-parsing" / "model.onnx"
 FACE_OCCLUDER_MODEL_DIR: Final[Path] = _WEIGHTS_ROOT / "face-occluder"
-YOLO_MODEL_DIR: Final[Path] = _WEIGHTS_ROOT / "yolo"
-YOLO_DEFAULT_MODEL: Final[str] = "yolo26n-seg.pt"
 NSFW_MODEL_DIR: Final[Path] = _WEIGHTS_ROOT
 
 SAM2_MODEL_DIR: Final[Path] = _WEIGHTS_ROOT / "sam2"

@@ -1,4 +1,6 @@
 import sys
+import warnings
+warnings.filterwarnings("ignore", message="`torch.jit.script` is deprecated.*", category=FutureWarning)
 
 from faceswap.shared.torch_config import configure_torch
 
